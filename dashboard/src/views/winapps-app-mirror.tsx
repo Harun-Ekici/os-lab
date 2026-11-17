@@ -1,13 +1,16 @@
 /**
  * Windows Apps Lab mirror: a draggable, resizable view of one real desktop window.
- * The inventory and captures are read-only; there is no input control in this phase.
+ * Input is opt-in, previewed, confirmed, and guarded by the backend arm lock.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
   ArrowClockwiseIcon, CircleNotchIcon, CrosshairIcon, EyeIcon, HandIcon, PushPinIcon, XIcon
 } from "@phosphor-icons/react";
 import { Badge, Empty, Field, Modal, Skeleton, Status } from "../components/ui";
-import { api, message, usePoll, type WinApp, type WinAppsInfo, type WinControlState, type WinElement, type WinInputKey } from "../lib/api";
+import {
+  api, message, usePoll, type WinApp, type WinAppsInfo, type WinAuditRow, type WinControlState,
+  type WinElement, type WinInputKey
+} from "../lib/api";
 
 const MIRROR_INTERVAL = 1500;
 const INVENTORY_INTERVAL = 5000;
@@ -16,7 +19,16 @@ const MIN_WIDTH = 280;
 const MIN_HEIGHT = 240;
 const FPS_HOVER = 5;
 const FPS_IDLE = 1.2;
-const INPUT_KEYS: WinInputKey[] = ["tab", "escape", "backspace", "delete", "up", "down", "left", "right", "space", "enter"];
+const INPUT_KEYS: WinInputKey[] = ["tab", "escape", "backspace", "delete", "up", "down", "left", "right", "enter"];
+const MOUSE_ACTIONS = ["click", "double_click", "right_click", "scroll_up", "scroll_down"] as const;
+type MouseAction = typeof MOUSE_ACTIONS[number];
+const MOUSE_ACTION_LABELS: Record<MouseAction, string> = {
+  click: "Click",
+  double_click: "Double-click",
+  right_click: "Right-click",
+  scroll_up: "Scroll up",
+  scroll_down: "Scroll down"
+};
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
@@ -31,6 +43,9 @@ function hotspotStyle(element: WinElement, bounds: { width: number; height: numb
 
 type PendingAction =
   | { kind: "click"; windowId: number; x: number; y: number; element?: WinElement }
+  | { kind: "double_click"; windowId: number; x: number; y: number; element?: WinElement }
+  | { kind: "right_click"; windowId: number; x: number; y: number; element?: WinElement }
+  | { kind: "scroll"; windowId: number; x: number; y: number; deltaX: number; deltaY: number; element?: WinElement }
   | { kind: "type"; windowId: number; text: string }
   | { kind: "key"; windowId: number; key: WinInputKey };
 
@@ -84,6 +99,22 @@ function labelFor(app: WinApp): string {
   return `${app.app}${title}`;
 }
 
+function auditLabel(row: WinAuditRow): string {
+  const action = row.action ?? row.kind;
+  const labels: Record<string, string> = {
+    arm: "Arm control",
+    disarm: "Disarm control",
+    "panic-stop": "Panic stop",
+    click: "Click",
+    double_click: "Double-click",
+    right_click: "Right-click",
+    scroll: "Scroll",
+    type: "Type text",
+    key: "Press key"
+  };
+  return labels[action] ?? "Action";
+}
+
 export function WinAppsPanel() {
   const { data, error, reload } = usePoll<WinAppsInfo>(
     () => api.winappsApps(), INVENTORY_INTERVAL
@@ -95,6 +126,7 @@ export function WinAppsPanel() {
   const [pos, setPos] = useState({ left: 0, top: 0, width: 440, height: 420 });
   const [showElements, setShowElements] = useState(false);
   const [query, setQuery] = useState("");
+  const [mouseAction, setMouseAction] = useState<MouseAction>("click");
   const [searchResult, setSearchResult] = useState<{ windowId: number; query: string; hits: WinElement[] } | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingAction | null>(null);
@@ -116,7 +148,7 @@ export function WinAppsPanel() {
 
   const windows = data?.windows ?? [];
   const selected = windows.find((window) => window.windowId === windowId) ?? windows[0] ?? null;
-  const { data: elementsData, error: elementsError } = usePoll(
+  const { data: elementsData, error: elementsError, reload: reloadElements } = usePoll(
     () => {
       if (!showElements || !selected) return Promise.resolve(null);
       if (revisionWindowRef.current !== selected.windowId) {
@@ -142,6 +174,7 @@ export function WinAppsPanel() {
     && searchResult.query === query.trim() ? searchResult : null;
   const hitIds = activeSearch ? new Set(activeSearch.hits.map((element) => element.elementId)) : null;
   const visibleElements = hitIds ? elements.filter((element) => hitIds.has(element.elementId)) : elements;
+  const recentActions = controlState?.recentActions ?? [];
 
   useEffect(() => {
     setPending(null);
@@ -297,7 +330,14 @@ export function WinAppsPanel() {
   const previewClick = (x: number, y: number, element?: WinElement) => {
     if (!selected || !shot) return;
     setActionError(null);
-    setPending({ kind: "click", windowId: selected.windowId, x: Math.round(x), y: Math.round(y), element });
+    const target = { windowId: selected.windowId, x: Math.round(x), y: Math.round(y), element };
+    if (mouseAction === "scroll_up" || mouseAction === "scroll_down") {
+      setPending({
+        kind: "scroll", ...target, deltaX: 0, deltaY: mouseAction === "scroll_up" ? 120 : -120
+      });
+    } else {
+      setPending({ kind: mouseAction, ...target });
+    }
   };
 
   const confirmPending = async () => {
@@ -309,6 +349,16 @@ export function WinAppsPanel() {
         await api.winappsClick({
           windowId: pending.windowId, x: pending.x, y: pending.y,
           owner: ownerRef.current, confirm: true
+        });
+      } else if (pending.kind === "double_click" || pending.kind === "right_click") {
+        await api.winappsInput({
+          windowId: pending.windowId, kind: pending.kind, x: pending.x, y: pending.y,
+          owner: ownerRef.current, confirm: true
+        });
+      } else if (pending.kind === "scroll") {
+        await api.winappsInput({
+          windowId: pending.windowId, kind: "scroll", x: pending.x, y: pending.y,
+          deltaX: pending.deltaX, deltaY: pending.deltaY, owner: ownerRef.current, confirm: true
         });
       } else if (pending.kind === "type") {
         await api.winappsInput({
@@ -323,6 +373,7 @@ export function WinAppsPanel() {
       }
       setPending(null);
       control.reload();
+      if (showElements) reloadElements();
     } catch (e) {
       setActionError(message(e));
       control.reload();
@@ -496,6 +547,14 @@ export function WinAppsPanel() {
             </>
           ) : null}
           <div className="grid gap-2 sm:grid-cols-2">
+            <Field label="Mouse action">
+              <select className="iux-input" value={mouseAction} aria-label="Mouse action"
+                onChange={(event) => setMouseAction(event.target.value as MouseAction)}>
+                {MOUSE_ACTIONS.map((action) => (
+                  <option key={action} value={action}>{MOUSE_ACTION_LABELS[action]}</option>
+                ))}
+              </select>
+            </Field>
             <div className="flex items-end gap-2">
               <Field label="Text to type">
                 <input className="iux-input" value={inputText} maxLength={200} aria-label="Text to type"
@@ -521,6 +580,26 @@ export function WinAppsPanel() {
               </button>
             </div>
           </div>
+          <section aria-label="Recent actions" className="rounded-lg border border-(--iux-border) px-3 py-2">
+            <p className="mb-1 text-xs font-semibold">Recent actions</p>
+            {recentActions.length ? (
+              <ol className="flex flex-col gap-1">
+                {recentActions.slice(-6).reverse().map((row, index) => (
+                  <li key={`${row.time}-${row.kind}-${index}`} className="flex items-center gap-2 text-xs">
+                    <span className="min-w-0 flex-1 truncate">
+                      {auditLabel(row)}{row.key ? ` · ${row.key}` : ""}{row.app ? ` · ${row.app}` : ""}
+                    </span>
+                    <span className={row.ok === false ? "text-(--iux-danger)" : "text-(--iux-muted-foreground)"}>
+                      {row.ok === false ? "Blocked" : "Sent"}
+                    </span>
+                    <time dateTime={new Date(row.time * 1000).toISOString()}>
+                      {new Date(row.time * 1000).toLocaleTimeString()}
+                    </time>
+                  </li>
+                ))}
+              </ol>
+            ) : <p className="text-xs text-(--iux-muted-foreground)">No actions yet.</p>}
+          </section>
           <div
             className="relative w-full cursor-crosshair overflow-hidden rounded-xl border border-(--iux-border) bg-black"
             style={{
@@ -607,7 +686,17 @@ export function WinAppsPanel() {
             ? pending.element
               ? <><span>Click UI element</span>: {pending.element.role}{pending.element.label ? `: ${pending.element.label}` : ""}</>
               : <><span>Click at</span> <code>{pending.x}, {pending.y}</code></>
-            : pending.kind === "type" ? <span>Type this text into the focused control</span> : <><span>Press key</span> <code>{pending.key}</code></>}
+            : pending.kind === "double_click" || pending.kind === "right_click"
+              ? pending.element
+                ? <><span>{pending.kind === "double_click" ? "Double-click UI element" : "Right-click UI element"}</span>
+                  : {pending.element.role}{pending.element.label ? `: ${pending.element.label}` : ""}</>
+                : <><span>{pending.kind === "double_click" ? "Double-click at" : "Right-click at"}</span>
+                  <code>{pending.x}, {pending.y}</code></>
+              : pending.kind === "scroll"
+                ? <><span>Scroll at</span> <code>{pending.x}, {pending.y}</code>
+                  <span> ({pending.deltaY > 0 ? "up" : "down"})</span></>
+                : pending.kind === "type" ? <span>Type this text into the focused control</span>
+                  : <><span>Press key</span> <code>{pending.key}</code></>}
         </p>
         {pending.kind === "type" ? (
           <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md border border-(--iux-border) p-3 text-xs">{pending.text}</pre>

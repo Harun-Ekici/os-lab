@@ -368,6 +368,7 @@ export interface WinApp {
   y: number;
   width: number;
   height: number;
+  dpi?: number | null;
 }
 export interface WinAppsInfo {
   available: boolean;
@@ -414,9 +415,34 @@ export interface WinControlState {
   armed: boolean;
   owner: string | null;
   expiresInSec: number;
+  recentActions: WinAuditRow[];
 }
-export type WinInputKind = "type" | "key";
-export type WinInputKey = "tab" | "escape" | "backspace" | "delete" | "up" | "down" | "left" | "right" | "space" | "enter";
+export interface WinAuditRow {
+  time: number;
+  kind: string;
+  action?: string;
+  windowId?: number;
+  app?: string;
+  x?: number;
+  y?: number;
+  deltaX?: number;
+  deltaY?: number;
+  textLength?: number;
+  key?: string;
+  ok?: boolean;
+}
+export type WinInputKind = "type" | "key" | "double_click" | "right_click" | "scroll";
+export type WinInputKey = "tab" | "escape" | "backspace" | "delete" | "up" | "down" | "left" | "right" | "enter";
+export type WinInputRequest = {
+  windowId: number;
+  owner: string;
+  confirm: true;
+} & (
+  | { kind: "type"; text: string }
+  | { kind: "key"; key: WinInputKey }
+  | { kind: "double_click" | "right_click"; x: number; y: number }
+  | { kind: "scroll"; x: number; y: number; deltaX: number; deltaY: number }
+);
 export interface Report {
   name: string;
   url: string;
@@ -825,8 +851,9 @@ export const api = {
     post<WinControlState>("/api/labs/winapps/control", { armed, owner }),
   winappsClick: (input: { windowId: number; x: number; y: number; owner: string; confirm: true }) =>
     post<{ ok: boolean; actionSent: boolean; windowId: number; x: number; y: number }>("/api/labs/winapps/click", input),
-  winappsInput: (input: { windowId: number; kind: WinInputKind; owner: string; confirm: true; text?: string; key?: WinInputKey }) =>
-    post<{ ok: boolean; actionSent: boolean; windowId: number; kind: WinInputKind; textLength: number; key?: WinInputKey }>("/api/labs/winapps/input", input),
+  winappsInput: (input: WinInputRequest) =>
+    post<{ ok: boolean; actionSent: boolean; windowId: number; kind: WinInputKind; action: WinInputKind; textLength: number;
+      key?: WinInputKey; x?: number; y?: number; deltaX?: number; deltaY?: number }>("/api/labs/winapps/input", input),
   winappsStop: () => post<{ ok: boolean; disarmed: boolean }>("/api/labs/winapps/stop", {}),
   plan: (request: LabRequest) => post<{ plan: LabPlan; token: string }>("/api/labs/plan", { request }),
   start: (request: LabRequest, token: string) => post<LabJob>("/api/labs/start", { request, token }),

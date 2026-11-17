@@ -97,13 +97,19 @@ matches labels or roles with at most 50 results. The mirror can display and
 search these controls as clickable hotspots.
 
 Control is separate and opt-in: `/control` grants one local owner a ten-minute
-lock, renewed after confirmed actions. Click and keyboard input require
-that lock, `confirm: true`, a fresh visible HWND, a foreground check for keyboard
-input, and bounded key/text allowlists. The dashboard previews each target in a
-confirmation dialog; Enter is explicitly called out because it can submit a
-form. A panic-stop endpoint disarms the lock and ends active mirror streams.
-Input auditing is bounded and does not retain typed text. Mutating requests
-continue to require the console's localhost/Host validation and `X-OSLab: 1`.
+lock, renewed after confirmed actions, and returns a bounded recent-action
+summary. Click and keyboard input require that lock, `confirm: true`, a fresh
+visible HWND, a foreground check for keyboard input, and bounded key/text
+allowlists. `/input` also supports double-click, right-click and bounded
+horizontal/vertical scroll deltas; the dashboard previews each target in a
+confirmation dialog, refreshes UIA after a successful action, and explicitly
+warns that Enter can submit a form. Win32 bounds, UIA rectangles, capture
+pixels and pointer coordinates share a per-monitor-aware physical-pixel space.
+Capture retries `PrintWindow(PW_RENDERFULLCONTENT)` and permits desktop blit
+fallback only when the target is not overlapped. A panic-stop endpoint disarms
+the lock and ends active mirror streams. Input auditing never retains typed
+text or window titles. Mutating requests continue to require the console's
+localhost/Host validation and `X-OSLab: 1`.
 
 ## UX readiness
 
