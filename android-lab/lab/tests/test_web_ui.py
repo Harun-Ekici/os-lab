@@ -217,6 +217,95 @@ def test_winapps_doctor_endpoint_serves_the_probe_and_is_501_without_the_module(
     assert caught.value.code == 501
 
 
+def test_winapps_uia_routes_return_elements_search_and_explicit_errors(web_server, monkeypatch):
+    import web_ui
+
+    elements = {
+        "windowId": 7, "app": "Example", "bounds": {"x": 1, "y": 2, "width": 3, "height": 4},
+        "revision": "rev-1", "engine": "uia", "trimmed": False,
+        "elements": [], "diff": {"added": [], "changed": [], "removed": []},
+    }
+    search = {"windowId": 7, "app": "Example", "revision": "rev-1", "query": "save", "count": 0, "hits": []}
+    monkeypatch.setattr(web_ui.winapps, "winapps_window_elements", lambda hwnd, revision: {
+        **elements, "windowId": int(hwnd), "requestedRevision": revision,
+    })
+    monkeypatch.setattr(web_ui.winapps, "winapps_search_elements", lambda hwnd, query: {
+        **search, "windowId": int(hwnd), "query": query,
+    })
+    monkeypatch.setattr(web_ui.winapps, "winapps_control_state", lambda: {
+        "armed": False, "owner": None, "expiresInSec": 0,
+    })
+
+    data = json.loads(urllib.request.urlopen(
+        f"{web_server}/api/labs/winapps/apps/7/elements?revision=old"
+    ).read().decode("utf-8"))
+    assert data["requestedRevision"] == "old" and data["windowId"] == 7
+    result = json.loads(urllib.request.urlopen(
+        f"{web_server}/api/labs/winapps/apps/7/search?q=save"
+    ).read().decode("utf-8"))
+    assert result["query"] == "save"
+    control = json.loads(urllib.request.urlopen(
+        f"{web_server}/api/labs/winapps/control"
+    ).read().decode("utf-8"))
+    assert control["armed"] is False
+
+    def unsupported(_hwnd, _revision):
+        raise web_ui.winapps.WinAppError("UI Automation is unavailable", status=501, code="UIA_UNAVAILABLE")
+
+    monkeypatch.setattr(web_ui.winapps, "winapps_window_elements", unsupported)
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/elements")
+    assert caught.value.code == 501
+    assert json.loads(caught.value.read().decode("utf-8"))["code"] == "UIA_UNAVAILABLE"
+
+
+def test_winapps_control_post_routes_require_header_and_dispatch_actions(web_server, monkeypatch):
+    import web_ui
+
+    calls = []
+
+    def arm(armed, owner):
+        calls.append(("arm", armed, owner))
+        return {"armed": armed, "owner": owner, "expiresInSec": 600}
+
+    def click(data):
+        calls.append(("click", data))
+        return {"ok": True, "actionSent": True}
+
+    def input_action(data):
+        calls.append(("input", data))
+        return {"ok": True, "actionSent": True}
+
+    def stop():
+        calls.append(("stop",))
+        return {"ok": True, "disarmed": True}
+
+    monkeypatch.setattr(web_ui.winapps, "winapps_control_arm", arm)
+    monkeypatch.setattr(web_ui.winapps, "winapps_control_click", click)
+    monkeypatch.setattr(web_ui.winapps, "winapps_control_input", input_action)
+    monkeypatch.setattr(web_ui.winapps, "winapps_panic_stop", stop)
+
+    status, rejected = _post(f"{web_server}/api/labs/winapps/control", {"armed": True, "owner": "panel"})
+    assert status == 403 and "X-OSLab" in rejected["error"]
+    headers = {"X-OSLab": "1"}
+    assert _post(f"{web_server}/api/labs/winapps/control", {"armed": True, "owner": "panel"}, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/click", {"x": 4, "y": 5}, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/input", {"kind": "key", "key": "tab"}, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/stop", {}, headers)[0] == 200
+    assert [call[0] for call in calls] == ["arm", "click", "input", "stop"]
+
+
+def test_winapps_control_post_preserves_validation_status(web_server, monkeypatch):
+    import web_ui
+
+    def refused(_data):
+        raise web_ui.winapps.WinAppError("Another dashboard holds the lock", status=409, code="INPUT_BUSY")
+
+    monkeypatch.setattr(web_ui.winapps, "winapps_control_click", refused)
+    status, data = _post(f"{web_server}/api/labs/winapps/click", {"confirm": True}, {"X-OSLab": "1"})
+    assert status == 409 and data["code"] == "INPUT_BUSY"
+
+
 def test_scope_endpoint_reports_the_declared_scope(web_server, tmp_path, monkeypatch):
     path = tmp_path / "scope.json"
     monkeypatch.setenv("OSLAB_SCOPE_FILE", str(path))
