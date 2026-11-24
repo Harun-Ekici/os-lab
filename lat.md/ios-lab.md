@@ -216,7 +216,9 @@ the computer-use runtimes share, with the guardrails intact:
   console, routes to `/labs/macos/`, and shows the handoff or stop result. There
   is deliberately no arm, click, type, or run-submission intent: the human
   still arms control in the dashboard and volatile PIDs/coordinates never
-  become Shortcut parameters.
+  become Shortcut parameters. The same rules hold for the `oslab://` command
+  bridge an external command button uses (see [[cleanup-lab]]):
+  a URL can stop control or open a page, never arm it or drive an input.
 - **QcU parity** — engine pieces the standalone QcU package has:
   `GET /api/labs/macos/{displays,capabilities,permissions,events}` and
   `…/apps/<id>/search?q=` (also MCP `macos_search`, `macos_displays`,

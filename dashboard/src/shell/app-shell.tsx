@@ -39,6 +39,7 @@ import {
 import { AppSidebar, SidebarBadge, useSidebarCollapsed, type SidebarGroup, type SidebarItem } from "./sidebar";
 import { Spotlight, type SpotlightCommand, type SpotlightMeta, type SpotlightRecord } from "./spotlight";
 import { LabSwitcher, type LabSwitcherLab } from "./lab-switcher";
+import { CommandBridgeBanner } from "./command-bridge";
 import { labOfSection, useActiveLab, type ActiveLabId } from "./active-lab";
 import { toggleMode, useThemeMode } from "./theme";
 import { UpdateModal } from "../views/update-modal";
@@ -685,6 +686,7 @@ export function AppShell({
           <div className="flex min-h-0 flex-1 flex-col overflow-y-auto">{children}</div>
         </div>
       </div>
+      {PUBLIC_PAGES ? null : <CommandBridgeBanner resolveHref={sectionHref} />}
       {PUBLIC_PAGES ? null : <UpdateModal />}
       {PUBLIC_PAGES ? null : (
         <LabSwitcher
