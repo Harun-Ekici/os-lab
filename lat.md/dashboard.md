@@ -85,7 +85,10 @@ On Windows hosts, `winapps` serves a read-only desktop mirror through
 `/api/labs/winapps/apps` and `/api/labs/winapps/apps/<hwnd>/screenshot`.
 
 The backend uses ctypes to enumerate visible, captioned top-level windows and
-captures one window with `PrintWindow(PW_RENDERFULLCONTENT)`. The panel shows
+captures one window with a bounded `WM_PRINT` request. An unresponsive app gets
+up to 1.5 seconds to paint; desktop-pixel fallback is used only when no higher
+window overlaps the target. Otherwise the API returns a timeout instead of
+blocking the console worker. The panel shows
 the selected window at its own aspect ratio, its dimensions and an `Elevated`
 badge when the owning process is elevated; only the newest capture updates the
 view. It is mounted only locally, is separate from the WSL2-backed VM lifecycle,
@@ -94,10 +97,15 @@ and does not offer input control.
 The local panel also supports a draggable/resizable floating mirror, dock/hide,
 and a bounded multipart PNG stream at
 `/api/labs/winapps/apps/<hwnd>/stream?fps=` with a screenshot-poll fallback.
-The stream validates the HWND before responding, disables caching, and closes
-when the client disconnects, the window disappears or the stream reaches its
-time limit. It remains read-only; Windows UI Automation hotspots and input
-control are separate future work.
+At most two streams can capture at once. Each stream is bound to the selected
+window identity and ends if the HWND is recycled, the client disconnects, or
+the stream reaches its time limit. Multipart frames are validated PNGs and are
+capped to the largest capture dimensions the backend permits. A stalled stream
+times out in the browser and falls back to snapshots; a large valid frame does
+not trigger polling. The floating panel clamps drag and resize bounds to the
+viewport and its contents remain scrollable on narrow screens. It remains
+read-only; Windows UI Automation hotspots and input control are separate
+future work.
 
 ## UX readiness
 

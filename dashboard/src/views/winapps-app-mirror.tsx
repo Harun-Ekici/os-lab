@@ -15,12 +15,17 @@ const MIN_WIDTH = 280;
 const MIN_HEIGHT = 240;
 const FPS_HOVER = 5;
 const FPS_IDLE = 1.2;
+const STREAM_IDLE_TIMEOUT_MS = 10_000;
+const STREAM_CONNECT_TIMEOUT_MS = 10_000;
+const MAX_CAPTURE_PIXELS = 7680 * 4320;
+const MAX_STREAM_FRAME_BYTES = MAX_CAPTURE_PIXELS * 4 + 1024 * 1024;
+const MAX_STREAM_HEADER_BYTES = 16_384;
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
 const HEADER_END = new TextEncoder().encode("\r\n\r\n");
-const LENGTH_KEY = new TextEncoder().encode("Content-Length: ");
 const CRLF = new TextEncoder().encode("\r\n");
+const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from: number): number {
   outer: for (let i = from; i <= haystack.length - needle.length; i++) {
@@ -39,33 +44,137 @@ function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
   return result;
 }
 
-async function pumpPngStream(response: Response, onFrame: (png: Uint8Array) => void): Promise<void> {
+function validatePngFrame(png: Uint8Array): void {
+  if (png.length < 57 || png.length > MAX_STREAM_FRAME_BYTES
+    || !PNG_SIGNATURE.every((byte, index) => png[index] === byte)) {
+    throw new Error("The mirror stream returned an invalid PNG frame");
+  }
+  const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
+  if (view.getUint32(8) !== 13 || view.getUint32(12) !== 0x49484452
+    || view.getUint32(png.length - 12) !== 0 || view.getUint32(png.length - 8) !== 0x49454e44
+    || view.getUint32(png.length - 4) !== 0xae426082) {
+    throw new Error("The mirror stream returned an invalid PNG frame");
+  }
+  const width = view.getUint32(16);
+  const height = view.getUint32(20);
+  if (!width || !height || width * height > MAX_CAPTURE_PIXELS) {
+    throw new Error("The mirror stream returned invalid PNG dimensions");
+  }
+}
+
+async function pumpPngStream(
+  response: Response,
+  onFrame: (png: Uint8Array) => void
+): Promise<void> {
   if (!response.body) throw new Error("The mirror stream ended");
   const reader = response.body.getReader();
-  let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  let frameLength: number | null = null;
+  let frameParts: Uint8Array[] = [];
+  let frameBytes = 0;
+  let expectCrlf = false;
+  const decoder = new TextDecoder();
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) return;
-    buffer = concatBytes(buffer, value);
-    for (;;) {
-      const lengthAt = indexOfBytes(buffer, LENGTH_KEY, 0);
-      if (lengthAt < 0) break;
-      const lineEnd = indexOfBytes(buffer, CRLF, lengthAt);
-      const headerEnd = indexOfBytes(buffer, HEADER_END, lengthAt);
-      if (lineEnd < 0 || headerEnd < 0) break;
-      const length = Number(new TextDecoder().decode(buffer.slice(lengthAt + LENGTH_KEY.length, lineEnd)));
-      const payloadAt = headerEnd + HEADER_END.length;
-      if (!Number.isSafeInteger(length) || length < 0 || buffer.length < payloadAt + length) break;
-      onFrame(buffer.slice(payloadAt, payloadAt + length));
-      buffer = buffer.slice(payloadAt + length + 2);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const read = await Promise.race([
+      reader.read(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("The mirror stream stalled")), STREAM_IDLE_TIMEOUT_MS);
+      })
+    ]).finally(() => {
+      if (timeout !== undefined) clearTimeout(timeout);
+    });
+    if (read.done) {
+      if (frameLength !== null || expectCrlf || pending.length) {
+        throw new Error("The mirror stream ended during a PNG frame");
+      }
+      return;
     }
-    if (buffer.length > 16_000_000) throw new Error("The mirror stream stalled");
+
+    let input = concatBytes(pending, read.value);
+    pending = new Uint8Array(0);
+    while (input.length) {
+      if (frameLength !== null) {
+        const length = Math.min(frameLength - frameBytes, input.length);
+        frameParts.push(input.slice(0, length));
+        frameBytes += length;
+        input = input.slice(length);
+        if (frameBytes === frameLength) {
+          const frame = new Uint8Array(frameLength);
+          let offset = 0;
+          for (const part of frameParts) {
+            frame.set(part, offset);
+            offset += part.length;
+          }
+          validatePngFrame(frame);
+          onFrame(frame);
+          frameLength = null;
+          frameParts = [];
+          frameBytes = 0;
+          expectCrlf = true;
+        }
+        continue;
+      }
+
+      if (expectCrlf) {
+        if (input.length < 2) {
+          pending = input;
+          break;
+        }
+        if (input[0] !== 13 || input[1] !== 10) {
+          throw new Error("The mirror stream returned malformed frame data");
+        }
+        input = input.slice(2);
+        expectCrlf = false;
+        continue;
+      }
+
+      const headerEnd = indexOfBytes(input, HEADER_END, 0);
+      if (headerEnd < 0) {
+        pending = input;
+        if (pending.length > MAX_STREAM_HEADER_BYTES) {
+          throw new Error("The mirror stream returned oversized headers");
+        }
+        break;
+      }
+      if (headerEnd > MAX_STREAM_HEADER_BYTES) {
+        throw new Error("The mirror stream returned oversized headers");
+      }
+      const header = decoder.decode(input.slice(0, headerEnd));
+      const contentType = header.match(/(?:^|\r\n)Content-Type:\s*([^\r\n]+)/i)?.[1]?.trim();
+      const rawLength = header.match(/(?:^|\r\n)Content-Length:\s*(\d+)\s*(?:\r\n|$)/i)?.[1];
+      const length = rawLength === undefined ? NaN : Number(rawLength);
+      if (!header.startsWith("--frame\r\n") || contentType?.toLowerCase() !== "image/png"
+        || !Number.isSafeInteger(length) || length < 57 || length > MAX_STREAM_FRAME_BYTES) {
+        throw new Error("The mirror stream returned invalid frame headers");
+      }
+      frameLength = length;
+      input = input.slice(headerEnd + HEADER_END.length);
+    }
   }
 }
 
 function labelFor(app: WinApp): string {
   const title = app.title ? ` — ${app.title.slice(0, 40)}` : "";
   return `${app.app}${title}`;
+}
+
+function constrainPanel(
+  rect: { left: number; top: number; width: number; height: number },
+  viewportWidth: number,
+  viewportHeight: number
+) {
+  const margin = 12;
+  const maxWidth = Math.max(1, viewportWidth - margin * 2);
+  const maxHeight = Math.max(1, viewportHeight - margin * 2);
+  const width = clamp(rect.width, Math.min(MIN_WIDTH, maxWidth), maxWidth);
+  const height = clamp(rect.height, Math.min(MIN_HEIGHT, maxHeight), maxHeight);
+  return {
+    left: clamp(rect.left, margin, Math.max(margin, viewportWidth - width - margin)),
+    top: clamp(rect.top, margin, Math.max(margin, viewportHeight - height - margin)),
+    width,
+    height
+  };
 }
 
 export function WinAppsPanel() {
@@ -77,21 +186,34 @@ export function WinAppsPanel() {
   const [hidden, setHidden] = useState(false);
   const [pos, setPos] = useState({ left: 0, top: 0, width: 440, height: 420 });
   const [shot, setShot] = useState<string | null>(null);
+  const [shotWindowId, setShotWindowId] = useState<number | null>(null);
   const [shotError, setShotError] = useState<string | null>(null);
   const [visible, setVisible] = useState(typeof document === "undefined" || !document.hidden);
   const [hovering, setHovering] = useState(false);
   const [streamState, setStreamState] = useState<"on" | "failed">("on");
   const shotRef = useRef<string | null>(null);
-  const grabSeq = useRef(0);
+  const selectedWindowIdRef = useRef<number | null>(null);
+  const streamGenerationRef = useRef(0);
+  const displaySequenceRef = useRef(0);
+  const snapshotControllerRef = useRef<AbortController | null>(null);
+  const snapshotInFlightRef = useRef(false);
 
   const windows = data?.windows ?? [];
   const selected = windows.find((window) => window.windowId === windowId) ?? windows[0] ?? null;
   const fps = hovering ? FPS_HOVER : FPS_IDLE;
+  selectedWindowIdRef.current = selected?.windowId ?? null;
 
   useEffect(() => {
-    setPos((current) => current.left === 0 && current.top === 0 && typeof window !== "undefined"
-      ? { ...current, left: Math.max(16, window.innerWidth - 480), top: 220 }
-      : current);
+    const initialize = () => setPos((current) => {
+      const initial = current.left === 0 && current.top === 0
+        ? { ...current, left: Math.max(12, window.innerWidth - 480), top: 220 }
+        : current;
+      return constrainPanel(initial, window.innerWidth, window.innerHeight);
+    });
+    const resize = () => setPos((current) => constrainPanel(current, window.innerWidth, window.innerHeight));
+    initialize();
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
   }, []);
 
   useEffect(() => {
@@ -99,38 +221,72 @@ export function WinAppsPanel() {
   }, [selected, windowId]);
 
   useEffect(() => {
+    displaySequenceRef.current += 1;
+    snapshotControllerRef.current?.abort();
+    snapshotControllerRef.current = null;
+    snapshotInFlightRef.current = false;
+    if (shotRef.current) URL.revokeObjectURL(shotRef.current);
+    shotRef.current = null;
+    setShot(null);
+    setShotWindowId(null);
+    setShotError(null);
+    setStreamState("on");
+  }, [selected?.windowId]);
+
+  useEffect(() => {
     const update = () => setVisible(!document.hidden);
     document.addEventListener("visibilitychange", update);
     return () => document.removeEventListener("visibilitychange", update);
   }, []);
 
-  const setShotFromBytes = useCallback((png: Uint8Array) => {
-    grabSeq.current += 1;
+  const setShotFromBytes = useCallback((
+    targetWindowId: number,
+    png: Uint8Array,
+    isCurrent: () => boolean
+  ) => {
+    if (!isCurrent() || selectedWindowIdRef.current !== targetWindowId) return;
     const url = URL.createObjectURL(new Blob([png.slice().buffer as ArrayBuffer], { type: "image/png" }));
     if (shotRef.current) URL.revokeObjectURL(shotRef.current);
     shotRef.current = url;
     setShot(url);
+    setShotWindowId(targetWindowId);
     setShotError(null);
   }, []);
 
   const grab = useCallback(async () => {
-    if (!selected || hidden) return;
-    const sequence = ++grabSeq.current;
+    const targetWindowId = selected?.windowId;
+    if (!targetWindowId || hidden || snapshotInFlightRef.current) return;
+    snapshotInFlightRef.current = true;
+    const sequence = ++displaySequenceRef.current;
+    const controller = new AbortController();
+    snapshotControllerRef.current = controller;
+    const timeout = setTimeout(() => controller.abort(), STREAM_CONNECT_TIMEOUT_MS);
     try {
-      const response = await fetch(api.winappsAppScreenshotUrl(selected.windowId), { cache: "no-store" });
+      const response = await fetch(api.winappsAppScreenshotUrl(targetWindowId), {
+        cache: "no-store",
+        signal: controller.signal
+      });
       if (!response.ok) {
         const body = (await response.json().catch(() => ({}))) as { error?: string };
         throw new Error(body.error || `${response.status} ${response.statusText}`);
       }
       const png = new Uint8Array(await response.arrayBuffer());
-      if (sequence !== grabSeq.current) return;
-      setShotFromBytes(png);
+      setShotFromBytes(targetWindowId, png, () =>
+        sequence === displaySequenceRef.current && selectedWindowIdRef.current === targetWindowId
+      );
     } catch (e) {
-      if (sequence !== grabSeq.current) return;
+      if (sequence !== displaySequenceRef.current || selectedWindowIdRef.current !== targetWindowId) return;
       setShot(null);
+      setShotWindowId(null);
       setShotError(message(e));
+    } finally {
+      clearTimeout(timeout);
+      if (snapshotControllerRef.current === controller) {
+        snapshotControllerRef.current = null;
+        snapshotInFlightRef.current = false;
+      }
     }
-  }, [hidden, selected?.windowId, setShotFromBytes]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [hidden, selected?.windowId, setShotFromBytes]);
 
   useEffect(() => () => {
     if (shotRef.current) URL.revokeObjectURL(shotRef.current);
@@ -152,27 +308,55 @@ export function WinAppsPanel() {
 
   useEffect(() => {
     if (!selected || hidden || streamState !== "on" || !visible) return;
+    const targetWindowId = selected.windowId;
+    const generation = ++streamGenerationRef.current;
+    let active = true;
+    let connected = false;
+    let timedOut = false;
     const controller = new AbortController();
+    const connectionTimer = setTimeout(() => {
+      if (!connected) {
+        timedOut = true;
+        controller.abort();
+      }
+    }, STREAM_CONNECT_TIMEOUT_MS);
     (async () => {
       try {
-        const response = await fetch(api.winappsAppStreamUrl(selected.windowId, fps), {
+        const response = await fetch(api.winappsAppStreamUrl(targetWindowId, fps), {
           signal: controller.signal,
           cache: "no-store"
         });
+        connected = true;
+        clearTimeout(connectionTimer);
         if (!response.ok) {
           const body = (await response.json().catch(() => ({}))) as { error?: string };
           throw new Error(body.error || `${response.status} ${response.statusText}`);
         }
-        await pumpPngStream(response, setShotFromBytes);
+        await pumpPngStream(response, (png) => {
+          if (!active || streamGenerationRef.current !== generation
+            || selectedWindowIdRef.current !== targetWindowId) return;
+          const sequence = ++displaySequenceRef.current;
+          setShotFromBytes(targetWindowId, png, () =>
+            active && streamGenerationRef.current === generation
+            && selectedWindowIdRef.current === targetWindowId
+            && displaySequenceRef.current === sequence
+          );
+        });
         throw new Error("The mirror stream ended");
       } catch (e) {
-        if ((e as Error).name === "AbortError") return;
-        setShot(null);
-        setShotError(message(e));
+        if (!active || streamGenerationRef.current !== generation
+          || selectedWindowIdRef.current !== targetWindowId) return;
+        controller.abort();
+        setShotError(timedOut ? "The mirror stream connection timed out" : message(e));
         setStreamState("failed");
       }
     })();
-    return () => controller.abort();
+    return () => {
+      active = false;
+      clearTimeout(connectionTimer);
+      controller.abort();
+      if (streamGenerationRef.current === generation) streamGenerationRef.current += 1;
+    };
   }, [selected?.windowId, hidden, streamState, visible, fps, setShotFromBytes]);
 
   const startDrag = (event: React.PointerEvent) => {
@@ -182,8 +366,10 @@ export function WinAppsPanel() {
     const move = (pointer: PointerEvent) => {
       setPos((current) => ({
         ...current,
-        left: clamp(origin.left + pointer.clientX - origin.x, 0, window.innerWidth - MIN_WIDTH),
-        top: clamp(origin.top + pointer.clientY - origin.y, 0, window.innerHeight - 120)
+        left: clamp(origin.left + pointer.clientX - origin.x, 12,
+          Math.max(12, window.innerWidth - current.width - 12)),
+        top: clamp(origin.top + pointer.clientY - origin.y, 12,
+          Math.max(12, window.innerHeight - current.height - 12))
       }));
     };
     const up = () => {
@@ -200,11 +386,15 @@ export function WinAppsPanel() {
     event.stopPropagation();
     const origin = { x: event.clientX, y: event.clientY, width: pos.width, height: pos.height };
     const move = (pointer: PointerEvent) => {
-      setPos((current) => ({
-        ...current,
-        width: clamp(origin.width + pointer.clientX - origin.x, MIN_WIDTH, window.innerWidth - 24),
-        height: clamp(origin.height + pointer.clientY - origin.y, MIN_HEIGHT, window.innerHeight - 24)
-      }));
+      setPos((current) => {
+        const maxWidth = Math.max(1, window.innerWidth - current.left - 12);
+        const maxHeight = Math.max(1, window.innerHeight - current.top - 12);
+        return {
+          ...current,
+          width: clamp(origin.width + pointer.clientX - origin.x, Math.min(MIN_WIDTH, maxWidth), maxWidth),
+          height: clamp(origin.height + pointer.clientY - origin.y, Math.min(MIN_HEIGHT, maxHeight), maxHeight)
+        };
+      });
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -246,9 +436,11 @@ export function WinAppsPanel() {
     </div>
   );
 
+  const currentShot = selected && shotWindowId === selected.windowId ? shot : null;
   const body = (
     <div className="flex flex-col gap-3">
       {error ? <Status value={{ ok: false, text: error }} /> : null}
+      {streamState === "failed" && shotError ? <Status value={{ ok: false, text: shotError }} /> : null}
       {!data ? (
         <Skeleton rows={2} />
       ) : !data.available ? (
@@ -291,9 +483,9 @@ export function WinAppsPanel() {
             onPointerEnter={() => setHovering(true)}
             onPointerLeave={() => setHovering(false)}
           >
-            {shot ? (
+            {currentShot ? (
               <img
-                src={shot}
+                src={currentShot}
                 alt={`Mirror of ${selected.app}`}
                 className="absolute inset-0 h-full w-full object-fill"
                 draggable={false}
@@ -307,6 +499,7 @@ export function WinAppsPanel() {
                   data-variant="outline"
                   onClick={() => {
                     setStreamState("on");
+                    setShotError(null);
                     void grab();
                   }}
                 >
@@ -343,7 +536,10 @@ export function WinAppsPanel() {
   return float ? (
     <div
       className="iux-card fixed z-40 flex flex-col overflow-hidden shadow-[0_18px_50px_-12px_rgba(0,0,0,0.55)]"
-      style={{ left: pos.left, top: pos.top, width: pos.width, height: pos.height }}
+      style={{
+        left: pos.left, top: pos.top, width: pos.width, height: pos.height,
+        maxWidth: "calc(100vw - 24px)", maxHeight: "calc(100dvh - 24px)"
+      }}
     >
       {header}
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">{body}</div>

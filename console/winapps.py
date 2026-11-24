@@ -1,8 +1,9 @@
 """Native Windows app mirror: enumerate visible windows and capture one window.
 
 The macOS Lab uses CoreGraphics through ctypes; this is the Windows counterpart.
-It deliberately stays standard-library ctypes only, needs no elevated process, and
-never exposes process command lines or performs input control.
+It uses a bounded WM_PRINT request with a visibility-checked desktop fallback,
+stays standard-library ctypes only, needs no elevated process, and never exposes
+process command lines or performs input control.
 """
 
 from __future__ import annotations
@@ -11,6 +12,7 @@ import ctypes
 import math
 import struct
 import sys
+import threading
 import time
 import zlib
 from ctypes import wintypes
@@ -29,10 +31,22 @@ MAX_TITLE_CHARS = 512
 MAX_WINDOW_CHARS = 200
 # 8K at 32 bits is ~130 MB of pixels; anything larger is refused instead of exhausting memory.
 MAX_CAPTURE_PIXELS = 7680 * 4320
+MAX_PNG_FRAME_BYTES = MAX_CAPTURE_PIXELS * 4 + 1024 * 1024
 MIN_STREAM_FPS = 0.5
 MAX_STREAM_FPS = 8.0
 DEFAULT_STREAM_FPS = 1.2
 MAX_STREAM_SECONDS = 600
+MAX_ACTIVE_STREAMS = 2
+CAPTURE_MESSAGE_TIMEOUT_MS = 1500
+WM_PRINT = 0x0317
+PRF_CHECKVISIBLE = 0x00000001
+PRF_NONCLIENT = 0x00000002
+PRF_CLIENT = 0x00000004
+PRF_ERASEBKGND = 0x00000008
+PRF_CHILDREN = 0x00000010
+SMTO_BLOCK = 0x00000001
+SMTO_ABORTIFHUNG = 0x00000002
+GW_HWNDPREV = 3
 TOOL_CLASSES = {
     "Shell_TrayWnd",
     "Shell_SecondaryTrayWnd",
@@ -43,6 +57,10 @@ TOOL_CLASSES = {
 
 class WinAppError(Exception):
     """A safe, user-presentable native window inventory/capture failure."""
+
+    def __init__(self, message: str, *, status: int = 400):
+        super().__init__(message)
+        self.status = status
 
 
 # Keep the Win32 data layout available to the offline tests on other hosts.
@@ -98,12 +116,19 @@ if sys.platform == "win32":
     _user32.GetClassNameW.restype = ctypes.c_int
     _user32.GetAncestor.argtypes = [wintypes.HWND, wintypes.UINT]
     _user32.GetAncestor.restype = wintypes.HWND
+    _user32.GetWindow.argtypes = [wintypes.HWND, wintypes.UINT]
+    _user32.GetWindow.restype = wintypes.HWND
+    _user32.GetDC.argtypes = [wintypes.HWND]
+    _user32.GetDC.restype = wintypes.HDC
     _user32.GetWindowDC.argtypes = [wintypes.HWND]
     _user32.GetWindowDC.restype = wintypes.HDC
     _user32.ReleaseDC.argtypes = [wintypes.HWND, wintypes.HDC]
     _user32.ReleaseDC.restype = ctypes.c_int
-    _user32.PrintWindow.argtypes = [wintypes.HWND, wintypes.HDC, wintypes.UINT]
-    _user32.PrintWindow.restype = wintypes.BOOL
+    _user32.SendMessageTimeoutW.argtypes = [
+        wintypes.HWND, wintypes.UINT, ctypes.c_size_t, ctypes.c_ssize_t,
+        wintypes.UINT, wintypes.UINT, ctypes.POINTER(ctypes.c_size_t),
+    ]
+    _user32.SendMessageTimeoutW.restype = ctypes.c_size_t
     if hasattr(_user32, "SetProcessDpiAwarenessContext"):  # Windows 10 1703+; older hosts use Shcore
         _user32.SetProcessDpiAwarenessContext.argtypes = [ctypes.c_void_p]
         _user32.SetProcessDpiAwarenessContext.restype = wintypes.BOOL
@@ -123,6 +148,13 @@ if sys.platform == "win32":
         ctypes.c_void_p, ctypes.POINTER(_BITMAPINFO), ctypes.c_uint,
     ]
     _gdi32.GetDIBits.restype = ctypes.c_int
+    _gdi32.BitBlt.argtypes = [
+        wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
+        wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
+    ]
+    _gdi32.BitBlt.restype = wintypes.BOOL
+    _gdi32.PatBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
+    _gdi32.PatBlt.restype = wintypes.BOOL
 
     _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _kernel32.OpenProcess.restype = wintypes.HANDLE
@@ -152,6 +184,8 @@ if sys.platform == "win32":
     _advapi32.GetTokenInformation.restype = wintypes.BOOL
 else:
     _user32 = _gdi32 = _kernel32 = _dwmapi = _advapi32 = None
+
+_STREAM_SLOTS = threading.BoundedSemaphore(MAX_ACTIVE_STREAMS)
 
 
 def _set_dpi_awareness() -> None:
@@ -331,26 +365,134 @@ def _png(width: int, height: int, bgra: bytes) -> bytes:
     return b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(bytes(raw), 3)) + chunk(b"IEND", b"")
 
 
-def winapps_window_screenshot(window_id: int) -> bytes:
-    """A PNG of one on-screen window. Raises WinAppError when the id is stale or capture fails."""
-    if sys.platform != "win32" or _user32 is None or _gdi32 is None:
-        raise WinAppError("Native Windows app mirror needs a Windows host")
+def validate_png_frame(frame: bytes) -> None:
+    """Reject malformed or oversized capture frames before they reach a stream client."""
+    if not isinstance(frame, bytes) or len(frame) > MAX_PNG_FRAME_BYTES or len(frame) < 57:
+        raise WinAppError("The Windows window capture returned an invalid PNG frame", status=502)
+    if frame[:8] != b"\x89PNG\r\n\x1a\n":
+        raise WinAppError("The Windows window capture returned an invalid PNG frame", status=502)
+    position = 8
+    width = height = 0
+    seen_ihdr = seen_idat = seen_iend = False
+    while position < len(frame):
+        if position + 12 > len(frame):
+            raise WinAppError("The Windows window capture returned an invalid PNG frame", status=502)
+        length = struct.unpack(">I", frame[position:position + 4])[0]
+        kind = frame[position + 4:position + 8]
+        end = position + 12 + length
+        if end > len(frame):
+            raise WinAppError("The Windows window capture returned an invalid PNG frame", status=502)
+        payload = frame[position + 8:position + 8 + length]
+        checksum = struct.unpack(">I", frame[position + 8 + length:end])[0]
+        if checksum != zlib.crc32(kind + payload):
+            raise WinAppError("The Windows window capture returned a corrupt PNG frame", status=502)
+        if not seen_ihdr:
+            if kind != b"IHDR" or length != 13:
+                raise WinAppError("The Windows window capture returned an invalid PNG header", status=502)
+            width, height = struct.unpack(">II", payload[:8])
+            if width <= 0 or height <= 0 or width * height > MAX_CAPTURE_PIXELS:
+                raise WinAppError("The Windows window capture returned invalid PNG dimensions", status=502)
+            seen_ihdr = True
+        elif kind == b"IHDR":
+            raise WinAppError("The Windows window capture returned an invalid PNG header", status=502)
+        if kind == b"IDAT":
+            seen_idat = True
+        if kind == b"IEND":
+            if length != 0 or end != len(frame):
+                raise WinAppError("The Windows window capture returned an invalid PNG end marker", status=502)
+            seen_iend = True
+            break
+        position = end
+    if not (seen_ihdr and seen_idat and seen_iend):
+        raise WinAppError("The Windows window capture returned an incomplete PNG frame", status=502)
+
+
+def _window_unoccluded(hwnd: int, window: dict[str, Any]) -> bool:
+    """Only allow desktop-pixel fallback when no higher window overlaps the target."""
+    if _user32 is None or not hasattr(_user32, "GetWindow"):
+        return False
+    left, top = window["x"], window["y"]
+    right, bottom = left + window["width"], top + window["height"]
+    above = _user32.GetWindow(hwnd, GW_HWNDPREV)
+    for _ in range(512):
+        if not above:
+            return True
+        if _user32.IsWindowVisible(above) and not _user32.IsIconic(above):
+            rect = _RECT()
+            if _user32.GetWindowRect(above, rect):
+                if max(left, rect.left) < min(right, rect.right) and max(top, rect.top) < min(bottom, rect.bottom):
+                    return False
+        above = _user32.GetWindow(above, GW_HWNDPREV)
+    return not above
+
+
+def _send_bounded_window_print(hwnd: int, memory_dc: Any) -> bool:
+    """Ask the target to paint through a bounded WM_PRINT instead of blocking in PrintWindow."""
+    result = ctypes.c_size_t()
+    flags = PRF_CHECKVISIBLE | PRF_NONCLIENT | PRF_CLIENT | PRF_ERASEBKGND | PRF_CHILDREN
+    return bool(_user32.SendMessageTimeoutW(
+        hwnd, WM_PRINT, memory_dc, flags, SMTO_BLOCK | SMTO_ABORTIFHUNG,
+        CAPTURE_MESSAGE_TIMEOUT_MS, ctypes.byref(result),
+    ))
+
+
+def _capture_desktop_fallback(memory_dc: Any, window: dict[str, Any]) -> bool:
+    """Copy visible desktop pixels only when the target's full bounds are unobscured."""
+    screen_dc = _user32.GetDC(0)
+    if not screen_dc:
+        return False
+    try:
+        return bool(_gdi32.BitBlt(
+            memory_dc, 0, 0, window["width"], window["height"],
+            screen_dc, window["x"], window["y"], 0x00CC0020 | 0x40000000,
+        ))
+    finally:
+        _user32.ReleaseDC(0, screen_dc)
+
+
+def _bitmap_pixels(memory_dc: Any, bitmap: Any, old_bitmap: Any, width: int, height: int) -> bytes:
+    _gdi32.SelectObject(memory_dc, old_bitmap)
+    bitmap_info = _BITMAPINFO()
+    bitmap_info.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
+    bitmap_info.bmiHeader.biWidth = width
+    bitmap_info.bmiHeader.biHeight = -height
+    bitmap_info.bmiHeader.biPlanes = 1
+    bitmap_info.bmiHeader.biBitCount = 32
+    bitmap_info.bmiHeader.biCompression = 0
+    bitmap_info.bmiHeader.biSizeImage = width * height * 4
+    pixels = (ctypes.c_ubyte * (width * height * 4))()
+    rows = _gdi32.GetDIBits(memory_dc, bitmap, 0, height, pixels, ctypes.byref(bitmap_info), 0)
+    if rows != height:
+        raise WinAppError("Could not read the captured window pixels")
+    return bytes(pixels)
+
+
+def _validated_window(window_id: int | str) -> tuple[int, dict[str, Any]]:
     try:
         hwnd = int(window_id)
     except (TypeError, ValueError):
         raise WinAppError("Invalid window id") from None
-    # An HWND carries 32 significant bits. Anything outside that range cannot be a window, and
-    # handing it to ctypes would raise (an HTTP 500) instead of failing cleanly.
     if not 0 < hwnd <= 0xFFFFFFFF:
         raise WinAppError("Invalid window id")
-    # Re-check just this window (same filters as the inventory) instead of enumerating every
-    # window and opening every process again for each screenshot.
     window = _window(hwnd) if _user32.GetAncestor(hwnd, GA_ROOT) == hwnd else None
     if window is None:
         raise WinAppError("That window is not on screen anymore; refresh the mirror")
-    width, height = window["width"], window["height"]
-    if width * height > MAX_CAPTURE_PIXELS:
+    if window["width"] * window["height"] > MAX_CAPTURE_PIXELS:
         raise WinAppError("That window is too large to capture")
+    return hwnd, window
+
+
+def _window_identity(hwnd: int, window: dict[str, Any]) -> tuple[Any, ...]:
+    thread_id = _user32.GetWindowThreadProcessId(hwnd, None)
+    return (thread_id, window["pid"], window["app"], window["className"], window["title"])
+
+
+def winapps_window_screenshot(window_id: int) -> bytes:
+    """Capture a window with a bounded app paint request and safe visible-pixel fallback."""
+    if sys.platform != "win32" or _user32 is None or _gdi32 is None:
+        raise WinAppError("Native Windows app mirror needs a Windows host")
+    hwnd, window = _validated_window(window_id)
+    width, height = window["width"], window["height"]
 
     screen_dc = _user32.GetWindowDC(hwnd)
     if not screen_dc:
@@ -362,28 +504,30 @@ def winapps_window_screenshot(window_id: int) -> bytes:
         if not memory_dc or not bitmap:
             raise WinAppError("Could not create the window capture surface")
         old_bitmap = _gdi32.SelectObject(memory_dc, bitmap)
-        captured = _user32.PrintWindow(hwnd, memory_dc, PW_RENDERFULLCONTENT)
-        # GetDIBits requires that the bitmap is not selected into a DC while it reads it.
-        _gdi32.SelectObject(memory_dc, old_bitmap)
-        bitmap_info = _BITMAPINFO()
-        bitmap_info.bmiHeader.biSize = ctypes.sizeof(_BITMAPINFOHEADER)
-        bitmap_info.bmiHeader.biWidth = width
-        bitmap_info.bmiHeader.biHeight = -height  # negative: top-down rows
-        bitmap_info.bmiHeader.biPlanes = 1
-        bitmap_info.bmiHeader.biBitCount = 32
-        bitmap_info.bmiHeader.biCompression = 0
-        bitmap_info.bmiHeader.biSizeImage = width * height * 4
-        pixels = (ctypes.c_ubyte * (width * height * 4))()
-        rows = _gdi32.GetDIBits(memory_dc, bitmap, 0, height, pixels, ctypes.byref(bitmap_info), 0)
+        if not old_bitmap:
+            raise WinAppError("Could not select the window capture surface")
+        _gdi32.PatBlt(memory_dc, 0, 0, width, height, 0x00000042)
+        rendered = _send_bounded_window_print(hwnd, memory_dc)
+        if not rendered:
+            if not _window_unoccluded(hwnd, window):
+                raise WinAppError(
+                    "The window did not respond to capture before the timeout and is covered; uncover it and retry",
+                    status=504,
+                )
+            if not _capture_desktop_fallback(memory_dc, window):
+                raise WinAppError("The window capture timed out and desktop fallback failed", status=504)
+        pixels = _bitmap_pixels(memory_dc, bitmap, old_bitmap, width, height)
     finally:
         if bitmap:
+            if memory_dc and old_bitmap:
+                _gdi32.SelectObject(memory_dc, old_bitmap)
             _gdi32.DeleteObject(bitmap)
         if memory_dc:
             _gdi32.DeleteDC(memory_dc)
         _user32.ReleaseDC(hwnd, screen_dc)
-    if not captured or rows != height:
-        raise WinAppError("Could not capture that window; try another application window")
-    return _png(width, height, bytes(pixels))
+    result = _png(width, height, pixels)
+    validate_png_frame(result)
+    return result
 
 
 def winapps_window_stream(window_id: int | str, fps: float) -> Iterator[bytes]:
@@ -393,23 +537,44 @@ def winapps_window_stream(window_id: int | str, fps: float) -> Iterator[bytes]:
     HWND can still be reported as a normal client error. If it disappears later, the
     stream ends cleanly and the dashboard can fall back to individual captures.
     """
+    if sys.platform != "win32" or _user32 is None or _gdi32 is None:
+        raise WinAppError("Native Windows app mirror needs a Windows host", status=501)
     if not math.isfinite(fps) or not MIN_STREAM_FPS <= fps <= MAX_STREAM_FPS:
         raise WinAppError(f"Frame rate must be between {MIN_STREAM_FPS:g} and {MAX_STREAM_FPS:g} FPS")
+    if not _STREAM_SLOTS.acquire(blocking=False):
+        raise WinAppError("The Windows app mirror already has the maximum number of active streams",
+                          status=429)
+    try:
+        hwnd, initial_window = _validated_window(window_id)
+        identity = _window_identity(hwnd, initial_window)
 
-    deadline = time.monotonic() + MAX_STREAM_SECONDS
-    yield winapps_window_screenshot(window_id)
-    interval = 1.0 / fps
-    while True:
-        remaining = deadline - time.monotonic()
-        if remaining <= 0:
-            return
-        time.sleep(min(interval, remaining))
-        if time.monotonic() >= deadline:
-            return
-        try:
-            yield winapps_window_screenshot(window_id)
-        except WinAppError:
-            return
+        def capture_bound_frame() -> bytes:
+            _current_hwnd, before = _validated_window(hwnd)
+            if _window_identity(hwnd, before) != identity:
+                raise WinAppError("The selected window changed; refresh the mirror")
+            frame = winapps_window_screenshot(hwnd)
+            _current_hwnd, after = _validated_window(hwnd)
+            if _window_identity(hwnd, after) != identity:
+                raise WinAppError("The selected window changed; refresh the mirror")
+            validate_png_frame(frame)
+            return frame
+
+        deadline = time.monotonic() + MAX_STREAM_SECONDS
+        yield capture_bound_frame()
+        interval = 1.0 / fps
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(min(interval, remaining))
+            if time.monotonic() >= deadline:
+                return
+            try:
+                yield capture_bound_frame()
+            except WinAppError:
+                return
+    finally:
+        _STREAM_SLOTS.release()
 
 
 def doctor() -> dict[str, Any]:

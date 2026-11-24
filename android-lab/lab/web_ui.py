@@ -542,7 +542,7 @@ class LabHttpHandler(BaseHTTPRequestHandler):
             try:
                 self._send_bytes(200, winapps.winapps_window_screenshot(parts[4]), "image/png", cache="no-store")
             except winapps.WinAppError as exc:
-                self._json(400, {"error": str(exc)})
+                self._json(exc.status, {"error": str(exc)})
         elif len(parts) == 6 and parts[:4] == ["api", "labs", "winapps", "apps"] and parts[5] == "stream":
             self._winapps_stream(parts[4])
         elif path == "/api/jobs":
@@ -714,11 +714,12 @@ class LabHttpHandler(BaseHTTPRequestHandler):
         try:
             frames = iter(winapps.winapps_window_stream(window_id, fps))
             first = next(frames)
+            winapps.validate_png_frame(first)
         except winapps.WinAppError as exc:
             close = getattr(frames, "close", None)
             if close:
                 close()
-            self._json(400, {"error": str(exc)})
+            self._json(exc.status, {"error": str(exc)})
             return
         except StopIteration:
             close = getattr(frames, "close", None)
@@ -741,6 +742,11 @@ class LabHttpHandler(BaseHTTPRequestHandler):
         try:
             write_frame(first)
             for frame in frames:
+                try:
+                    winapps.validate_png_frame(frame)
+                except winapps.WinAppError as exc:
+                    self.log_error("WinApps stream ended on an invalid frame: %s", exc)
+                    return
                 write_frame(frame)
         except OSError:
             pass  # the client disconnected or its socket closed

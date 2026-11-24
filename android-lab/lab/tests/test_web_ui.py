@@ -163,10 +163,11 @@ def test_winapps_stream_serves_bounded_multipart_frames_without_caching(web_serv
     import web_ui
 
     frames = []
+    png = web_ui.winapps._png(1, 1, bytes(4))
 
     def stream(window_id, fps):
         frames.append((window_id, fps))
-        return (b"\x89PNG first", b"\x89PNG second")
+        return (png, png)
 
     monkeypatch.setattr(web_ui.winapps, "winapps_window_stream", stream)
     reply = urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/stream?fps=50")
@@ -177,7 +178,14 @@ def test_winapps_stream_serves_bounded_multipart_frames_without_caching(web_serv
     assert reply.headers["X-Content-Type-Options"] == "nosniff"
     assert body.count(b"--frame\r\n") == 2
     assert b"Content-Type: image/png\r\n" in body
-    assert b"\x89PNG first" in body and b"\x89PNG second" in body
+    parts = body.split(b"--frame\r\n")[1:]
+    assert len(parts) == 2
+    for part in parts:
+        headers, payload = part.split(b"\r\n\r\n", 1)
+        content_length = int(next(line.split(b": ", 1)[1] for line in headers.split(b"\r\n")
+                                  if line.startswith(b"Content-Length: ")))
+        assert payload == png + b"\r\n"
+        assert content_length == len(png)
     assert frames == [("7", web_ui.winapps.MAX_STREAM_FPS)]
 
 
@@ -185,6 +193,8 @@ def test_winapps_stream_reports_a_stale_window_before_streaming(web_server, monk
     import web_ui
 
     def stale(_window_id, _fps):
+        if False:
+            yield b""
         raise web_ui.winapps.WinAppError("That window is not on screen anymore; refresh the mirror")
 
     monkeypatch.setattr(web_ui.winapps, "winapps_window_stream", stale)
@@ -192,6 +202,16 @@ def test_winapps_stream_reports_a_stale_window_before_streaming(web_server, monk
         urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/stream")
     assert caught.value.code == 400
     assert "not on screen" in json.loads(caught.value.read().decode("utf-8"))["error"]
+
+
+def test_winapps_stream_rejects_an_invalid_first_frame_before_headers(web_server, monkeypatch):
+    import web_ui
+
+    monkeypatch.setattr(web_ui.winapps, "winapps_window_stream", lambda _window_id, _fps: iter([b"not a PNG"]))
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/stream")
+    assert caught.value.code == 502
+    assert "invalid PNG" in json.loads(caught.value.read().decode("utf-8"))["error"]
 
 
 def test_winapps_stream_is_unavailable_without_the_native_module(web_server, monkeypatch):
