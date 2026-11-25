@@ -311,6 +311,8 @@ else:
 
 _STREAM_SLOTS = threading.BoundedSemaphore(MAX_ACTIVE_STREAMS)
 
+_STREAM_SLOTS = threading.BoundedSemaphore(MAX_ACTIVE_STREAMS)
+
 
 def _set_dpi_awareness() -> None:
     """Set per-monitor DPI awareness once, so coordinates stay physical pixels."""
