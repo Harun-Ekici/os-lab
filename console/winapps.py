@@ -1348,14 +1348,18 @@ def _record_audit(kind: str, *, window: dict[str, Any] | None = None,
         del _AUDIT_ROWS[:-CONTROL_AUDIT_MAX]
 
 
-def _audit_summary() -> list[dict[str, Any]]:
+def _audit_summary_locked() -> list[dict[str, Any]]:
     fields = ("time", "kind", "action", "windowId", "app", "x", "y", "deltaX",
               "deltaY", "textLength", "key", "ok")
+    return [
+        {key: row[key] for key in fields if key in row}
+        for row in _AUDIT_ROWS[-CONTROL_AUDIT_DISPLAY_MAX:]
+    ]
+
+
+def _audit_summary() -> list[dict[str, Any]]:
     with _AUDIT_LOCK:
-        return [
-            {key: row[key] for key in fields if key in row}
-            for row in _AUDIT_ROWS[-CONTROL_AUDIT_DISPLAY_MAX:]
-        ]
+        return _audit_summary_locked()
 
 
 def _control_active_locked(now: float) -> bool:
@@ -1376,7 +1380,7 @@ def winapps_control_state() -> dict[str, Any]:
             {key: row[key] for key in ("time", "kind", "windowId", "app", "ok", "reason") if key in row}
             for row in _AUDIT_ROWS[-10:]
         ]
-        recent_actions = _audit_summary()
+        recent_actions = _audit_summary_locked()
     return {
         "armed": armed,
         "owner": owner,
