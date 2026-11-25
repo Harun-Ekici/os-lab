@@ -131,19 +131,6 @@ summary; it never includes typed text or window titles. Input auditing is
 bounded. Mutating requests continue to require the console's localhost/Host
 validation and `X-OSLab: 1`.
 
-The local panel also supports a draggable/resizable floating mirror, dock/hide,
-and a bounded multipart PNG stream at
-`/api/labs/winapps/apps/<hwnd>/stream?fps=` with a screenshot-poll fallback.
-At most two streams can capture at once. Each stream is bound to the selected
-window identity and ends if the HWND is recycled, the client disconnects, or
-the stream reaches its time limit. Multipart frames are validated PNGs and are
-capped to the largest capture dimensions the backend permits. A stalled stream
-times out in the browser and falls back to snapshots; a large valid frame does
-not trigger polling. The floating panel clamps drag and resize bounds to the
-viewport and its contents remain scrollable on narrow screens. It remains
-read-only; Windows UI Automation hotspots and input control are separate
-future work.
-
 ## UX readiness
 
 [[ux-readiness]] records the dashboard's action, endpoint, and navigation
