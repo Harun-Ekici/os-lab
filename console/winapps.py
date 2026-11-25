@@ -263,13 +263,6 @@ if sys.platform == "win32":
         ctypes.c_void_p, ctypes.POINTER(_BITMAPINFO), ctypes.c_uint,
     ]
     _gdi32.GetDIBits.restype = ctypes.c_int
-    _gdi32.BitBlt.argtypes = [
-        wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int,
-        wintypes.HDC, ctypes.c_int, ctypes.c_int, wintypes.DWORD,
-    ]
-    _gdi32.BitBlt.restype = wintypes.BOOL
-    _gdi32.PatBlt.argtypes = [wintypes.HDC, ctypes.c_int, ctypes.c_int, ctypes.c_int, ctypes.c_int, wintypes.DWORD]
-    _gdi32.PatBlt.restype = wintypes.BOOL
 
     _kernel32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
     _kernel32.OpenProcess.restype = wintypes.HANDLE

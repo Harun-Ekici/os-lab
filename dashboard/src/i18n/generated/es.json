@@ -2871,6 +2871,7 @@
   "Could not stop macOS Lab control:": "No se pudo detener el control del laboratorio macOS:",
   "Click": "Clic",
   "Pointer action": "Acción del puntero",
+  "Recent actions": "Acciones recientes",
   "Scroll": "Desplazar",
   "Scroll amount": "Cantidad de desplazamiento",
   "Submission review opened. Select a Terminal or VM window to inspect and capture evidence. Control actions still require confirmation or armed mode.": "Se abrió la revisión de la entrega. Selecciona una ventana de Terminal o de máquina virtual para inspeccionarla y capturar pruebas. Las acciones de control siguen requiriendo confirmación o el modo de control activado.",
