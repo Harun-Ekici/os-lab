@@ -18,6 +18,8 @@ import { OverviewCards, StorageHero, type OverviewCard } from "./overview";
 import { SpaceExplorer } from "./space-explorer";
 import { RelocationCard } from "./relocation-card";
 import { WidgetsCard } from "./widgets-card";
+import { CareList, CareRow } from "./care-sections";
+import { SuggestionSettings } from "./suggestion-settings";
 import { ScanCard } from "./scan-card";
 import { PermissionGuide } from "./permission-guide";
 import { CatalogPage } from "./catalog-page";
@@ -263,8 +265,9 @@ function ConfirmDialog({
  * pretending the button would do something.
  */
 function QuickCleanCard({
-  bookmarks, busy, canWork, measured, refusals, onQuickClean, settingsHref
+  bookmarks, busy, canWork, measured, refusals, onQuickClean, settingsHref, bare
 }: {
+  bare?: boolean;
   bookmarks: BookmarksPayload | null; busy: boolean; canWork: boolean;
   measured: Map<string, CleanupScan["entries"][number]>; refusals: string;
   onQuickClean: () => void; settingsHref: string;
@@ -273,20 +276,24 @@ function QuickCleanCard({
   const quick = items.filter((item) => item.quickClean);
   const quickBytes = quick.reduce((sum, item) => sum + (measured.get(item.entryId)?.sizeBytes ?? 0), 0);
   const measuredQuick = quick.some((item) => measured.get(item.entryId)?.sizeBytes != null);
-  return <Section id="overview-quick-clean" title="Quick clean" description="One confirmed Trash run over the bookmarks marked for quick cleanup.">
+  const frame = (children: React.ReactNode) => bare ? <div>{children}</div>
+    : <Section id="overview-quick-clean" title="Quick clean" description="One confirmed Trash run over your quick-clean bookmarks, or the recommended safe set when none are marked.">{children}</Section>;
+  return frame(<>
     <div className="flex items-baseline gap-2">
-      <span dir="ltr" className="text-3xl font-bold tabular-nums">{measuredQuick ? bytes(quickBytes) : "—"}</span>
-      <span className="text-sm text-(--iux-muted-foreground)">measured in quick-clean bookmarks</span>
+      {quick.length ? <>
+        <span dir="ltr" className="text-3xl font-bold tabular-nums">{measuredQuick ? bytes(quickBytes) : "—"}</span>
+        <span className="text-sm text-(--iux-muted-foreground)">measured in quick-clean bookmarks</span>
+      </> : <span className="text-sm font-medium">Recommended set</span>}
     </div>
-    <p className="text-sm text-(--iux-muted-foreground)">{quick.length} of {items.length} bookmarks included</p>
+    <p className="text-sm text-(--iux-muted-foreground)">{quick.length ? `${quick.length} of ${items.length} bookmarks included` : "No bookmark is marked for quick clean, so it scans and reviews the recommended safe set."}</p>
     {refusals && <Status value={{ ok: false, text: refusals }} />}
     <div className="mt-3 flex flex-wrap gap-2">
-      <button type="button" className="iux-btn" data-variant="primary" disabled={!canWork || !quick.length || busy} onClick={onQuickClean}>Quick clean</button>
+      <button type="button" className="iux-btn" data-variant="primary" disabled={!canWork || busy} onClick={onQuickClean}>Quick clean</button>
       <a className="iux-btn" href={settingsHref}>Manage bookmarks</a>
     </div>
-    {items.length === 0 ? <p className="mt-2 text-xs text-(--iux-muted-foreground)">No bookmarks yet — bookmark entries on the Advanced scan page or add folders in Settings.</p>
-      : quick.length === 0 ? <p className="mt-2 text-xs text-(--iux-muted-foreground)">No bookmarks are marked for quick clean yet — enable quick clean in Settings.</p> : null}
-  </Section>;
+    {items.length === 0 ? <p className="mt-2 text-xs text-(--iux-muted-foreground)">Bookmark entries on the Advanced scan page or add folders in Settings to choose your own quick-clean set.</p>
+      : quick.length === 0 ? <p className="mt-2 text-xs text-(--iux-muted-foreground)">Enable quick clean on a bookmark in Settings to choose your own set.</p> : null}
+  </>);
 }
 
 export default function CleanupPage({ page: initialPage = "" }: { page?: CleanupPageId }) {
@@ -312,7 +319,15 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
   const [confirm, setConfirm] = useState(false);
   const [bookmarkConfirm, setBookmarkConfirm] = useState(false);
   const [quickRefusals, setQuickRefusals] = useState("");
+  /** CUX-01: set by "Scan & review"; the finished scan then builds the recommended Trash plan by itself. */
+  const autoReview = useRef(false);
+  const [reviewNote, setReviewNote] = useState("");
+  const [prefsSummary, setPrefsSummary] = useState("auto");
   const [order, setOrder] = useState<SortOrder>("size");
+  // CUX-03: the Advanced scan filter bar.
+  const [query, setQuery] = useState("");
+  const [riskFilter, setRiskFilter] = useState("");
+  const [measuredOnly, setMeasuredOnly] = useState(false);
   const [now, setNow] = useState(Date.now() / 1000);
   const coreLoaded = useRef(false);
   const locale = typeof window === "undefined" ? "en" : localeFromPath(window.location.pathname);
@@ -443,6 +458,8 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
    */
   function runQuickClean() {
     setActionError(""); setQuickRefusals("");
+    // CUX-02: with no bookmark flagged for quick clean, fall back to the recommended set (scan, plan, confirm).
+    if (!(bookmarks?.bookmarks ?? []).some((item) => item.quickClean)) { scanAndReview(); return; }
     void api.cleanupBookmarkQuickClean()
       .then((response) => {
         setQuickRefusals(response.refusals.map((item) => item.reason).join(" "));
@@ -569,6 +586,46 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
   const suggested = safeEntries.filter((item) => preset === "extended" || item.defaultSelected);
   const suggestedIds = suggested.map((item) => item.id);
   const suggestedBytes = suggested.reduce((sum, item) => sum + (measured.get(item.id)?.sizeBytes ?? 0), 0);
+  // CUX-01: a scan started with "Scan & review" continues into the recommended Trash plan, whose
+  // confirmation dialog then opens through the effect above. Only a completed, uncancelled scan continues.
+  useEffect(() => {
+    if (!autoReview.current || !active || !isScan(active) || active.state === "running") return;
+    autoReview.current = false;
+    const result = active.result as CleanupScan | undefined;
+    if (active.state !== "done" || !result) return;
+    if (result.cancelled) { setReviewNote("Scan stopped, so no plan was built. Scan again to review."); return; }
+    // CUX-08: the server picks what to clean from this scan: catalog defaults, the disk's pressure,
+    // quick-clean bookmarks and the user's saved preferences.
+    const jobId = active.id;
+    void api.cleanupSuggest(jobId).then((suggestion) => {
+      if (!suggestion.items.length) { setReviewNote("The scan found nothing to suggest. Adjust the suggestion settings or open Advanced scan."); return; }
+      const need = suggestion.pressure.underPressure && !suggestion.pressure.covers
+        ? ` Safe items cover ${bytes(suggestion.totalBytes)} of the ${bytes(suggestion.pressure.shortfallBytes)} the disk needs; Space Explorer can find more.` : "";
+      setReviewNote(`Suggested ${bytes(suggestion.totalBytes)} from ${suggestion.items.length} items.${need}`);
+      void start(() => api.cleanupPlan(suggestion.items.map((item) => item.id), "trash"));
+    }).catch((error) => setActionError(errorText(error)));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active?.id, active?.state]);
+  // CUX-06: "S" starts Scan & review on the dashboard when no field has focus.
+  useEffect(() => {
+    if (PUBLIC || page !== "") return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key.toLowerCase() !== "s" || event.metaKey || event.ctrlKey || event.altKey || event.shiftKey) return;
+      const target = event.target as HTMLElement | null;
+      if (target && (target.isContentEditable || ["INPUT", "TEXTAREA", "SELECT"].includes(target.tagName))) return;
+      if (status?.state !== "ready" || busy) return;
+      event.preventDefault();
+      scanAndReview();
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  });
+  function scanAndReview() {
+    autoReview.current = true;
+    setReviewNote("");
+    void start(() => api.cleanupScan(entries.map((item) => item.id)));
+  }
   const planFollowsScan = !!planJob && jobs.findIndex((job) => job.id === planJob.id) <= jobs.findIndex(isScan);
   const planMatches = !!latestPlan && planFollowsScan && latestPlan.mode === "trash" && JSON.stringify([...(planJob?.request.entryIds ?? [])].sort()) === JSON.stringify([...suggestedIds].sort());
   const canConfirmSuggested = canWork && !!latestPlan && planMatches && !planUsed && latestPlan.expiresAt > now && latestPlan.totals.ready > 0;
@@ -596,6 +653,21 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
   }, [page]);
   const selectedBytes = useMemo(() => selected.reduce((sum, id) => sum + (sizes.get(id) ?? 0), 0), [selected, sizes]);
   const sortedEntries = useMemo(() => sortEntries(entries, sizes, order), [entries, sizes, order]);
+  const visibleEntries = useMemo(() => {
+    const needle = query.trim().toLowerCase();
+    return sortedEntries.filter((item) => {
+      if (riskFilter && item.risk !== riskFilter) return false;
+      if (measuredOnly && !(sizes.get(item.id) ?? 0)) return false;
+      if (!needle) return true;
+      return item.name.toLowerCase().includes(needle) || item.id.toLowerCase().includes(needle)
+        || item.paths.some((path) => (path.path ?? "").toLowerCase().includes(needle));
+    });
+  }, [sortedEntries, query, riskFilter, measuredOnly, sizes]);
+  const riskOptions = useMemo(() => [...new Set(entries.map((item) => item.risk))], [entries]);
+  // Select visible never picks entries that need a deliberate choice (the same rule as Defaults).
+  const bulkVisible = visibleEntries.filter((item) => item.risk !== "credentials" && item.risk !== "privacy" && item.risk !== "high");
+  const canSelectMore = bulkVisible.some((item) => !selected.includes(item.id));
+  const hiddenSelected = selected.filter((id) => !visibleEntries.some((item) => item.id === id)).length;
   const riskTotals = useMemo(() => totalsByRisk(entries, sizes), [entries, sizes]);
   const resultGroups = useMemo(() => {
     if (!latestScan) return [];
@@ -631,7 +703,13 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
       { id: "scan", label: "Scan this entry", disabledReason: notReady, onSelect: () => void start(() => api.cleanupScan([item.id])) },
       { id: "clean", label: mode === "delete" ? "Review & delete permanently…" : "Review & clean…", disabledReason: cleanBlock, tone: mode === "delete" ? "danger" : undefined,
         onSelect: () => { setSelected((old) => old.includes(item.id) ? old : [...old, item.id]); void start(() => api.cleanupPlan([item.id], mode)); } },
-      { id: "select", label: on ? "Deselect" : "Select", separatorBefore: true, onSelect: () => { setSelected((old) => on ? old.filter((id) => id !== item.id) : [...old, item.id]); setConfirm(false); } },
+      ...(!PUBLIC ? [
+        { id: "reveal", label: "Reveal in file manager", separatorBefore: true, disabledReason: item.paths.some((path) => path.path) ? undefined : "This entry has no folder on this computer.",
+          onSelect: () => void api.cleanupRevealEntry(item.id).catch((error) => setActionError(errorText(error))) },
+        { id: "copy", label: "Copy path", disabledReason: item.paths.some((path) => path.path) ? undefined : "This entry has no folder on this computer.",
+          onSelect: () => { const target = item.paths.find((path) => path.path)?.path ?? ""; void navigator.clipboard.writeText(target).catch(() => setActionError("Could not copy the path. Select it in the entry details instead.")); } }
+      ] : []),
+      { id: "select", label: on ? "Deselect" : "Select", onSelect: () => { setSelected((old) => on ? old.filter((id) => id !== item.id) : [...old, item.id]); setConfirm(false); } },
       { id: "only", label: "Select only this", onSelect: () => { setSelected([item.id]); setConfirm(false); } },
       ...(!PUBLIC ? [{ id: "bookmark", label: bookmarkedIds.has(item.id) ? "Remove bookmark" : "Add bookmark", separatorBefore: true, onSelect: () => toggleBookmark(item.id) }] : [])
     ];
@@ -671,16 +749,33 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
           </Section>}
           {page === "" && <>
             {!PUBLIC && status?.state === "ready" && <StorageHero volumes={volumes} onRefresh={reloadVolumes} />}
-            {!PUBLIC && status?.state === "ready" && <div className="grid items-start gap-5 lg:grid-cols-2">
-              <QuickCleanCard bookmarks={bookmarks} busy={busy} canWork={canWork} measured={measured} refusals={quickRefusals}
-                onQuickClean={runQuickClean} settingsHref={link("settings/")} />
+            {!PUBLIC && status?.state === "ready" && <>
               <ScanCard active={active} entries={entries} measured={sizes} checked={dashChecked ?? defaultChecked} setChecked={setDashChecked}
-                canWork={canWork} scanned={!!latestScan} error={actionError}
-                onScan={() => void start(() => api.cleanupScan(entries.map((item) => item.id)))} onCancel={() => void cancel()}
+                canWork={canWork} scanned={!!latestScan} error={actionError} note={reviewNote}
+                onScan={() => { autoReview.current = false; setReviewNote(""); void start(() => api.cleanupScan(entries.map((item) => item.id))); }}
+                onScanReview={scanAndReview} onCancel={() => void cancel()}
                 onClean={(ids) => void start(() => api.cleanupPlan(ids, "trash"))}
                 groupHref={(id) => link(`catalog/#${id}`)} />
-            </div>}
-            {!PUBLIC && status?.state === "ready" && <MonitorStatsCard monitor={monitor} volumes={volumes} settingsHref={link("settings/")} />}
+              {/* CUX-09: everything else, collapsed, with a live one-line summary; nothing is removed from the app. */}
+              <CareList label="Cleanup options">
+                <CareRow id="overview-suggestions" title="Suggestions" summary={<><span>{prefsSummary}</span> · <span>saved on this computer</span></>}>
+                  <SuggestionSettings entries={entries} sizes={sizes} onSaved={(saved) => setPrefsSummary(saved.mode)} />
+                </CareRow>
+                <CareRow id="overview-quick-clean" title="Quick clean" summary={<><span dir="ltr" className="tabular-nums">{(bookmarks?.bookmarks ?? []).filter((item) => item.quickClean).length}</span> <span>bookmarked</span></>}>
+                  <QuickCleanCard bare bookmarks={bookmarks} busy={busy} canWork={canWork} measured={measured} refusals={quickRefusals}
+                    onQuickClean={runQuickClean} settingsHref={link("settings/")} />
+                </CareRow>
+                <CareRow id="cleanup-monitor" title="Alerts" attention={!!monitor?.activeWarnings.length}
+                  summary={!monitor?.enabled ? <span>off</span> : monitor.activeWarnings.length
+                    ? <><span dir="ltr" className="tabular-nums">{monitor.activeWarnings.length}</span> <span>{monitor.activeWarnings.some((w) => w.level === "critical") ? "low-space critical" : "low-space warning"}</span></>
+                    : <span>on, disk ok</span>}>
+                  <MonitorStatsCard bare monitor={monitor} volumes={volumes} settingsHref={link("settings/")} reload={monitorReload} />
+                </CareRow>
+                <CareRow id="cleanup-tools" title="All tools" summary="scan, explore, containers, packages, relocation, history and more">
+                  <OverviewCards go={goCard} />
+                </CareRow>
+              </CareList>
+            </>}
             {latestClean && <Section title="Latest clean report" description={`${latestClean.totals.trashed} moved to Trash · ${latestClean.totals.skipped} skipped · ${latestClean.totals.failed} failed`}>
               <div className="flex flex-wrap gap-2">
                 <Badge tone={latestClean.totals.trashed ? "success" : undefined}>{itemStatusLabel("trashed")} {latestClean.totals.trashed}</Badge>
@@ -733,12 +828,26 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
                     {active?.state === "running" && <button type="button" className="iux-btn" onClick={() => void cancel()}>Cancel</button>}
                   </div>
                 </div>
+                <div className="mt-2 flex flex-wrap items-center gap-2" role="search">
+                  <input type="search" className="iux-input min-w-48 flex-1" aria-label="Find an entry or path" placeholder="Find an entry or path"
+                    value={query} onChange={(event) => setQuery(event.target.value)} />
+                  <select className="iux-input" aria-label="Filter by risk" value={riskFilter} onChange={(event) => setRiskFilter(event.target.value)}>
+                    <option value="">All risks</option>
+                    {riskOptions.map((risk) => <option key={risk} value={risk}>{riskLabel(risk)}</option>)}
+                  </select>
+                  <label className="flex items-center gap-1.5 text-sm"><input type="checkbox" className="accent-[#f36c21]" checked={measuredOnly} onChange={(event) => setMeasuredOnly(event.target.checked)} />Measured only</label>
+                  <button type="button" className="iux-btn" data-variant="outline" disabled={busy || (!canSelectMore && !visibleEntries.some((item) => selected.includes(item.id)))}
+                    onClick={() => { setSelected((old) => canSelectMore ? [...new Set([...old, ...bulkVisible.map((item) => item.id)])] : old.filter((id) => !visibleEntries.some((item) => item.id === id))); setConfirm(false); }}>
+                    {canSelectMore ? "Select visible" : "Deselect visible"}
+                  </button>
+                  <span role="status" className="text-xs text-(--iux-muted-foreground)"><span dir="ltr" className="tabular-nums">{visibleEntries.length} / {entries.length}</span> <span>shown</span>{hiddenSelected > 0 && <> · <span dir="ltr" className="tabular-nums">{hiddenSelected}</span> <span>selected hidden by filters</span></>}</span>
+                </div>
                 {active?.state === "running" && <div className="mt-2 space-y-1">
                   <div className="iux-progress h-1 rounded-full" aria-hidden="true" />
                   <p role="status" aria-live="polite" className="text-xs">{active.kind} in progress · <span dir="ltr">{String(active.progress?.pathsDone ?? active.progress?.itemsDone ?? 0)} / {String(active.progress?.pathsTotal ?? active.progress?.itemsTotal ?? 0)}</span><span translate="no" className="block truncate">{active.progress?.currentPath}</span></p>
                 </div>}
                 </div>
-                <div className="mt-2 grid grid-cols-[repeat(auto-fill,minmax(13.5rem,1fr))] gap-1.5">{sortedEntries.map((item) => {
+                <div className="mt-2 grid grid-cols-[repeat(auto-fill,minmax(13.5rem,1fr))] gap-1.5">{visibleEntries.map((item) => {
                   const size = sizes.get(item.id);
                   const on = selected.includes(item.id);
                   return <label key={item.id} onContextMenu={(event) => { event.preventDefault(); setEntryMenu({ x: event.clientX, y: event.clientY, entryId: item.id }); }}
@@ -747,7 +856,7 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
                       <input type="checkbox" className="iux-touch-target size-3.5 shrink-0 accent-[#f36c21]" checked={on} disabled={busy}
                         onChange={(event) => { setSelected((old) => event.target.checked ? [...old, item.id] : old.filter((id) => id !== item.id)); setConfirm(false); }} />
                       <CategoryIcon category={item.category} size={12} />
-                      <span className="min-w-0 flex-1 truncate text-[13px] font-medium" title={item.name}>{item.name}</span>
+                      <span className="min-w-0 flex-1 line-clamp-2 break-words text-[13px] font-medium" title={item.name}>{item.name}</span>
                       {item.needsPrivilege && <PrivilegeMarker />}
                       <button type="button" className="iux-btn" data-variant="ghost" aria-haspopup="menu" aria-label={`Actions for ${item.name}`}
                         onClick={(event) => { event.preventDefault(); const box = event.currentTarget.getBoundingClientRect(); setEntryMenu({ x: box.left, y: box.bottom + 4, entryId: item.id }); }}>
@@ -765,6 +874,7 @@ export default function CleanupPage({ page: initialPage = "" }: { page?: Cleanup
                     {size != null && <SizeBar value={size} max={maxSize} />}
                   </label>;
                 })}</div>
+                {!visibleEntries.length && <Empty>No entries match these filters.</Empty>}
                 {entryMenu && (() => {
                   const item = entries.find((entry) => entry.id === entryMenu.entryId);
                   return item ? <EntryMenu state={entryMenu} title={item.name} items={entryMenuItems(item)} onClose={() => setEntryMenu(null)} /> : null;

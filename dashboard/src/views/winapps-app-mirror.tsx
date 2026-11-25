@@ -1,6 +1,6 @@
 /**
  * Windows Apps Lab mirror: a draggable, resizable view of one real desktop window.
- * Input is opt-in, previewed, confirmed, and guarded by the backend arm lock.
+ * The mirror keeps capture, UI Automation and guarded input tied to one window; input is opt-in, previewed, confirmed, and guarded by the backend arm lock.
  */
 import { useCallback, useEffect, useRef, useState } from "react";
 import {
@@ -8,8 +8,8 @@ import {
 } from "@phosphor-icons/react";
 import { Badge, Empty, Field, Modal, Skeleton, Status } from "../components/ui";
 import {
-  api, message, usePoll, type WinApp, type WinAppsInfo, type WinAuditRow, type WinControlState,
-  type WinElement, type WinInputKey
+  api, message, usePoll, type WinActionBinding, type WinApp, type WinAppsInfo, type WinAuditRow,
+  type WinControlState, type WinElement, type WinElementsInfo, type WinInputKey
 } from "../lib/api";
 
 const MIRROR_INTERVAL = 1500;
@@ -20,38 +20,132 @@ const MIN_HEIGHT = 240;
 const FPS_HOVER = 5;
 const FPS_IDLE = 1.2;
 const INPUT_KEYS: WinInputKey[] = ["tab", "escape", "backspace", "delete", "up", "down", "left", "right", "enter"];
-const MOUSE_ACTIONS = ["click", "double_click", "right_click", "scroll_up", "scroll_down"] as const;
+const STREAM_IDLE_TIMEOUT_MS = 10_000;
+const STREAM_CONNECT_TIMEOUT_MS = 10_000;
+const MAX_CAPTURE_PIXELS = 7680 * 4320;
+const MAX_STREAM_FRAME_BYTES = MAX_CAPTURE_PIXELS * 4 + 1024 * 1024;
+const MAX_STREAM_HEADER_BYTES = 16_384;
+const MAX_SCROLL_DELTA = 1200;
+
+const MOUSE_ACTIONS = ["click", "double_click", "right_click", "scroll"] as const;
 type MouseAction = typeof MOUSE_ACTIONS[number];
 const MOUSE_ACTION_LABELS: Record<MouseAction, string> = {
   click: "Click",
   double_click: "Double-click",
   right_click: "Right-click",
-  scroll_up: "Scroll up",
-  scroll_down: "Scroll down"
+  scroll: "Scroll"
 };
 
 const clamp = (value: number, min: number, max: number) => Math.min(Math.max(value, min), max);
 
-function hotspotStyle(element: WinElement, bounds: { width: number; height: number }) {
+type Rect = { left: number; top: number; right: number; bottom: number };
+
+function overlaps(a: Rect, b: Rect): boolean {
+  return a.left < b.right && b.left < a.right && a.top < b.bottom && b.top < a.bottom;
+}
+
+function hotspotStyles(
+  element: WinElement,
+  elements: WinElement[],
+  bounds: { width: number; height: number },
+  display: { width: number; height: number },
+  coarsePointer: boolean
+) {
+  const displayWidth = display.width || bounds.width;
+  const displayHeight = display.height || bounds.height;
+  const scaleX = displayWidth / bounds.width;
+  const scaleY = displayHeight / bounds.height;
+  const exact: Rect = {
+    left: element.x * scaleX,
+    top: element.y * scaleY,
+    right: (element.x + element.w) * scaleX,
+    bottom: (element.y + element.h) * scaleY
+  };
+  let hit = { ...exact };
+  if (coarsePointer) {
+    const neighbors = elements.filter((candidate) => candidate.elementId !== element.elementId).map((candidate) => ({
+      left: candidate.x * scaleX,
+      top: candidate.y * scaleY,
+      right: (candidate.x + candidate.w) * scaleX,
+      bottom: (candidate.y + candidate.h) * scaleY
+    }));
+    if (!neighbors.some((neighbor) => overlaps(exact, neighbor))) {
+      const centerX = (exact.left + exact.right) / 2;
+      const centerY = (exact.top + exact.bottom) / 2;
+      hit = {
+        left: Math.max(0, centerX - Math.max(44, exact.right - exact.left) / 2),
+        top: Math.max(0, centerY - Math.max(44, exact.bottom - exact.top) / 2),
+        right: Math.min(displayWidth, centerX + Math.max(44, exact.right - exact.left) / 2),
+        bottom: Math.min(displayHeight, centerY + Math.max(44, exact.bottom - exact.top) / 2)
+      };
+      for (const neighbor of neighbors) {
+        if (!overlaps(hit, neighbor)) continue;
+        const horizontalGap = exact.right <= neighbor.left || neighbor.right <= exact.left;
+        const verticalGap = exact.bottom <= neighbor.top || neighbor.bottom <= exact.top;
+        const verticalOverlap = exact.top < neighbor.bottom && neighbor.top < exact.bottom;
+        const horizontalOverlap = exact.left < neighbor.right && neighbor.left < exact.right;
+        if (horizontalGap && verticalOverlap) {
+          if (neighbor.left >= exact.right) hit.right = Math.min(hit.right, neighbor.left);
+          else hit.left = Math.max(hit.left, neighbor.right);
+        } else if (verticalGap && horizontalOverlap) {
+          if (neighbor.top >= exact.bottom) hit.bottom = Math.min(hit.bottom, neighbor.top);
+          else hit.top = Math.max(hit.top, neighbor.bottom);
+        } else {
+          hit = { ...exact };
+          break;
+        }
+      }
+      if (neighbors.some((neighbor) => overlaps(hit, neighbor))) hit = { ...exact };
+      hit.left = Math.min(hit.left, exact.left);
+      hit.top = Math.min(hit.top, exact.top);
+      hit.right = Math.max(hit.right, exact.right);
+      hit.bottom = Math.max(hit.bottom, exact.bottom);
+    }
+  }
+  const hitWidth = Math.max(1, hit.right - hit.left);
+  const hitHeight = Math.max(1, hit.bottom - hit.top);
+  const style = (rect: Rect, width: number, height: number) => ({
+    left: `${(rect.left / width) * 100}%`,
+    top: `${(rect.top / height) * 100}%`,
+    width: `${((rect.right - rect.left) / width) * 100}%`,
+    height: `${((rect.bottom - rect.top) / height) * 100}%`
+  });
   return {
-    left: `${(element.x / bounds.width) * 100}%`,
-    top: `${(element.y / bounds.height) * 100}%`,
-    width: `${(element.w / bounds.width) * 100}%`,
-    height: `${(element.h / bounds.height) * 100}%`
+    hit: style(hit, displayWidth, displayHeight),
+    visible: style({
+      left: exact.left - hit.left,
+      top: exact.top - hit.top,
+      right: exact.right - hit.left,
+      bottom: exact.bottom - hit.top
+    }, hitWidth, hitHeight)
   };
 }
 
 type PendingAction =
-  | { kind: "click"; windowId: number; x: number; y: number; element?: WinElement }
-  | { kind: "double_click"; windowId: number; x: number; y: number; element?: WinElement }
-  | { kind: "right_click"; windowId: number; x: number; y: number; element?: WinElement }
-  | { kind: "scroll"; windowId: number; x: number; y: number; deltaX: number; deltaY: number; element?: WinElement }
-  | { kind: "type"; windowId: number; text: string }
-  | { kind: "key"; windowId: number; key: WinInputKey };
+  | (WinActionBinding & {
+    kind: "click";
+    x: number;
+    y: number;
+    element: WinElement;
+    action: "click" | "double_click" | "right_click" | "scroll";
+    deltaX: number;
+    deltaY: number;
+  })
+  | (WinActionBinding & { kind: "type"; text: string })
+  | (WinActionBinding & { kind: "key"; key: WinInputKey });
+
+function actionId(): string {
+  return typeof crypto !== "undefined" && crypto.randomUUID
+    ? crypto.randomUUID() : `winapps-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+}
+
+function elementBounds(element: WinElement): WinActionBinding["elementBounds"] {
+  return { x: element.x, y: element.y, w: element.w, h: element.h };
+}
 
 const HEADER_END = new TextEncoder().encode("\r\n\r\n");
-const LENGTH_KEY = new TextEncoder().encode("Content-Length: ");
 const CRLF = new TextEncoder().encode("\r\n");
+const PNG_SIGNATURE = new Uint8Array([137, 80, 78, 71, 13, 10, 26, 10]);
 
 function indexOfBytes(haystack: Uint8Array, needle: Uint8Array, from: number): number {
   outer: for (let i = from; i <= haystack.length - needle.length; i++) {
@@ -70,27 +164,113 @@ function concatBytes(a: Uint8Array, b: Uint8Array): Uint8Array {
   return result;
 }
 
-async function pumpPngStream(response: Response, onFrame: (png: Uint8Array) => void): Promise<void> {
+function validatePngFrame(png: Uint8Array): void {
+  if (png.length < 57 || png.length > MAX_STREAM_FRAME_BYTES
+    || !PNG_SIGNATURE.every((byte, index) => png[index] === byte)) {
+    throw new Error("The mirror stream returned an invalid PNG frame");
+  }
+  const view = new DataView(png.buffer, png.byteOffset, png.byteLength);
+  if (view.getUint32(8) !== 13 || view.getUint32(12) !== 0x49484452
+    || view.getUint32(png.length - 12) !== 0 || view.getUint32(png.length - 8) !== 0x49454e44
+    || view.getUint32(png.length - 4) !== 0xae426082) {
+    throw new Error("The mirror stream returned an invalid PNG frame");
+  }
+  const width = view.getUint32(16);
+  const height = view.getUint32(20);
+  if (!width || !height || width * height > MAX_CAPTURE_PIXELS) {
+    throw new Error("The mirror stream returned invalid PNG dimensions");
+  }
+}
+
+async function pumpPngStream(
+  response: Response,
+  onFrame: (png: Uint8Array) => void
+): Promise<void> {
   if (!response.body) throw new Error("The mirror stream ended");
   const reader = response.body.getReader();
-  let buffer: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  let pending: Uint8Array<ArrayBufferLike> = new Uint8Array(0);
+  let frameLength: number | null = null;
+  let frameParts: Uint8Array[] = [];
+  let frameBytes = 0;
+  let expectCrlf = false;
+  const decoder = new TextDecoder();
   for (;;) {
-    const { done, value } = await reader.read();
-    if (done) return;
-    buffer = concatBytes(buffer, value);
-    for (;;) {
-      const lengthAt = indexOfBytes(buffer, LENGTH_KEY, 0);
-      if (lengthAt < 0) break;
-      const lineEnd = indexOfBytes(buffer, CRLF, lengthAt);
-      const headerEnd = indexOfBytes(buffer, HEADER_END, lengthAt);
-      if (lineEnd < 0 || headerEnd < 0) break;
-      const length = Number(new TextDecoder().decode(buffer.slice(lengthAt + LENGTH_KEY.length, lineEnd)));
-      const payloadAt = headerEnd + HEADER_END.length;
-      if (!Number.isSafeInteger(length) || length < 0 || buffer.length < payloadAt + length) break;
-      onFrame(buffer.slice(payloadAt, payloadAt + length));
-      buffer = buffer.slice(payloadAt + length + 2);
+    let timeout: ReturnType<typeof setTimeout> | undefined;
+    const read = await Promise.race([
+      reader.read(),
+      new Promise<never>((_resolve, reject) => {
+        timeout = setTimeout(() => reject(new Error("The mirror stream stalled")), STREAM_IDLE_TIMEOUT_MS);
+      })
+    ]).finally(() => {
+      if (timeout !== undefined) clearTimeout(timeout);
+    });
+    if (read.done) {
+      if (frameLength !== null || expectCrlf || pending.length) {
+        throw new Error("The mirror stream ended during a PNG frame");
+      }
+      return;
     }
-    if (buffer.length > 16_000_000) throw new Error("The mirror stream stalled");
+
+    let input = concatBytes(pending, read.value);
+    pending = new Uint8Array(0);
+    while (input.length) {
+      if (frameLength !== null) {
+        const length = Math.min(frameLength - frameBytes, input.length);
+        frameParts.push(input.slice(0, length));
+        frameBytes += length;
+        input = input.slice(length);
+        if (frameBytes === frameLength) {
+          const frame = new Uint8Array(frameLength);
+          let offset = 0;
+          for (const part of frameParts) {
+            frame.set(part, offset);
+            offset += part.length;
+          }
+          validatePngFrame(frame);
+          onFrame(frame);
+          frameLength = null;
+          frameParts = [];
+          frameBytes = 0;
+          expectCrlf = true;
+        }
+        continue;
+      }
+
+      if (expectCrlf) {
+        if (input.length < 2) {
+          pending = input;
+          break;
+        }
+        if (input[0] !== 13 || input[1] !== 10) {
+          throw new Error("The mirror stream returned malformed frame data");
+        }
+        input = input.slice(2);
+        expectCrlf = false;
+        continue;
+      }
+
+      const headerEnd = indexOfBytes(input, HEADER_END, 0);
+      if (headerEnd < 0) {
+        pending = input;
+        if (pending.length > MAX_STREAM_HEADER_BYTES) {
+          throw new Error("The mirror stream returned oversized headers");
+        }
+        break;
+      }
+      if (headerEnd > MAX_STREAM_HEADER_BYTES) {
+        throw new Error("The mirror stream returned oversized headers");
+      }
+      const header = decoder.decode(input.slice(0, headerEnd));
+      const contentType = header.match(/(?:^|\r\n)Content-Type:\s*([^\r\n]+)/i)?.[1]?.trim();
+      const rawLength = header.match(/(?:^|\r\n)Content-Length:\s*(\d+)\s*(?:\r\n|$)/i)?.[1];
+      const length = rawLength === undefined ? NaN : Number(rawLength);
+      if (!header.startsWith("--frame\r\n") || contentType?.toLowerCase() !== "image/png"
+        || !Number.isSafeInteger(length) || length < 57 || length > MAX_STREAM_FRAME_BYTES) {
+        throw new Error("The mirror stream returned invalid frame headers");
+      }
+      frameLength = length;
+      input = input.slice(headerEnd + HEADER_END.length);
+    }
   }
 }
 
@@ -115,6 +295,24 @@ function auditLabel(row: WinAuditRow): string {
   return labels[action] ?? "Action";
 }
 
+function constrainPanel(
+  rect: { left: number; top: number; width: number; height: number },
+  viewportWidth: number,
+  viewportHeight: number
+) {
+  const margin = 12;
+  const maxWidth = Math.max(1, viewportWidth - margin * 2);
+  const maxHeight = Math.max(1, viewportHeight - margin * 2);
+  const width = clamp(rect.width, Math.min(MIN_WIDTH, maxWidth), maxWidth);
+  const height = clamp(rect.height, Math.min(MIN_HEIGHT, maxHeight), maxHeight);
+  return {
+    left: clamp(rect.left, margin, Math.max(margin, viewportWidth - width - margin)),
+    top: clamp(rect.top, margin, Math.max(margin, viewportHeight - height - margin)),
+    width,
+    height
+  };
+}
+
 export function WinAppsPanel() {
   const { data, error, reload } = usePoll<WinAppsInfo>(
     () => api.winappsApps(), INVENTORY_INTERVAL
@@ -127,42 +325,91 @@ export function WinAppsPanel() {
   const [showElements, setShowElements] = useState(false);
   const [query, setQuery] = useState("");
   const [mouseAction, setMouseAction] = useState<MouseAction>("click");
-  const [searchResult, setSearchResult] = useState<{ windowId: number; query: string; hits: WinElement[] } | null>(null);
+  const [scrollDeltaY, setScrollDeltaY] = useState(120);
+  const [searchResult, setSearchResult] = useState<{
+    windowId: number; windowToken: string; revision: string; query: string; hits: WinElement[];
+  } | null>(null);
   const [searchError, setSearchError] = useState<string | null>(null);
   const [pending, setPending] = useState<PendingAction | null>(null);
   const [inputText, setInputText] = useState("");
   const [inputKey, setInputKey] = useState<WinInputKey>("tab");
   const [actionError, setActionError] = useState<string | null>(null);
   const [controlBusy, setControlBusy] = useState(false);
+  const [previewBusy, setPreviewBusy] = useState(false);
   const [shot, setShot] = useState<string | null>(null);
+  const [shotWindowId, setShotWindowId] = useState<number | null>(null);
+  const [shotWindowToken, setShotWindowToken] = useState<string | null>(null);
+  const [elementsSnapshot, setElementsSnapshot] = useState<WinElementsInfo | null>(null);
+  const [mirrorSize, setMirrorSize] = useState({ width: 0, height: 0 });
+  const [coarsePointer, setCoarsePointer] = useState(false);
   const [shotError, setShotError] = useState<string | null>(null);
   const [visible, setVisible] = useState(typeof document === "undefined" || !document.hidden);
   const [hovering, setHovering] = useState(false);
   const [streamState, setStreamState] = useState<"on" | "failed">("on");
   const shotRef = useRef<string | null>(null);
-  const grabSeq = useRef(0);
   const revisionRef = useRef<string | undefined>(undefined);
   const revisionWindowRef = useRef<number | null>(null);
   const ownerRef = useRef<string>(typeof crypto !== "undefined" && crypto.randomUUID
     ? crypto.randomUUID() : `winapps-${Date.now()}`);
+  const ownerArmedRef = useRef(false);
+  const selectedWindowIdRef = useRef<number | null>(null);
+  const selectedWindowTokenRef = useRef<string | null>(null);
+  const streamGenerationRef = useRef(0);
+  const displaySequenceRef = useRef(0);
+  const snapshotControllerRef = useRef<AbortController | null>(null);
+  const snapshotInFlightRef = useRef(false);
+  const mirrorRef = useRef<HTMLDivElement | null>(null);
+  const elementsRequestRef = useRef<{
+    windowId: number; windowToken: string; promise: Promise<WinElementsInfo | null>;
+  } | null>(null);
 
   const windows = data?.windows ?? [];
   const selected = windows.find((window) => window.windowId === windowId) ?? windows[0] ?? null;
-  const { data: elementsData, error: elementsError, reload: reloadElements } = usePoll(
-    () => {
-      if (!showElements || !selected) return Promise.resolve(null);
-      if (revisionWindowRef.current !== selected.windowId) {
-        revisionWindowRef.current = selected.windowId;
-        revisionRef.current = undefined;
-      }
-      return api.winappsElements(selected.windowId, revisionRef.current).then((result) => {
-        revisionRef.current = result.revision;
-        return result;
-      });
-    },
+  selectedWindowIdRef.current = selected?.windowId ?? null;
+  selectedWindowTokenRef.current = selected?.windowToken ?? null;
+  const requestElementsRef = useRef<() => Promise<WinElementsInfo | null>>(() => Promise.resolve(null));
+
+  const requestElements = useCallback((): Promise<WinElementsInfo | null> => {
+    if (!selected) return Promise.resolve(null);
+    const target = selected;
+    const inFlight = elementsRequestRef.current;
+    if (inFlight?.windowId === target.windowId && inFlight.windowToken === target.windowToken) {
+      return inFlight.promise;
+    }
+    if (inFlight) {
+      return inFlight.promise.then(
+        () => requestElementsRef.current(),
+        () => requestElementsRef.current()
+      );
+    }
+    if (revisionWindowRef.current !== target.windowId) {
+      revisionWindowRef.current = target.windowId;
+      revisionRef.current = undefined;
+    }
+    let request: Promise<WinElementsInfo | null>;
+    request = api.winappsElements(target.windowId, revisionRef.current, target.windowToken).then((result) => {
+      if (selectedWindowIdRef.current !== target.windowId
+        || selectedWindowTokenRef.current !== target.windowToken
+        || result.windowToken !== target.windowToken) return null;
+      revisionRef.current = result.revision;
+      setElementsSnapshot(result);
+      return result;
+    }).finally(() => {
+      if (elementsRequestRef.current?.promise === request) elementsRequestRef.current = null;
+    });
+    elementsRequestRef.current = { windowId: target.windowId, windowToken: target.windowToken, promise: request };
+    return request;
+  }, [selected?.windowId, selected?.windowToken]);
+  requestElementsRef.current = requestElements;
+  const { data: polledElements, error: elementsError } = usePoll(
+    () => showElements ? requestElements() : Promise.resolve(null),
     showElements && !hidden ? ELEMENTS_INTERVAL : 0,
-    [showElements, hidden, selected?.windowId]
+    [showElements, hidden, selected?.windowId, selected?.windowToken, requestElements]
   );
+  const elementsData = selected && elementsSnapshot?.windowId === selected.windowId
+    && elementsSnapshot.windowToken === selected.windowToken ? elementsSnapshot
+    : selected && polledElements?.windowId === selected.windowId
+      && polledElements.windowToken === selected.windowToken ? polledElements : null;
   const fps = hovering ? FPS_HOVER : FPS_IDLE;
   const controlState = control.data;
   const armed = controlState?.armed === true;
@@ -171,6 +418,7 @@ export function WinAppsPanel() {
   const elements = selected && elementsData?.windowId === selected.windowId
     ? elementsData?.elements ?? [] : [];
   const activeSearch = selected && searchResult && searchResult.windowId === selected.windowId
+    && searchResult.windowToken === selected.windowToken
     && searchResult.query === query.trim() ? searchResult : null;
   const hitIds = activeSearch ? new Set(activeSearch.hits.map((element) => element.elementId)) : null;
   const visibleElements = hitIds ? elements.filter((element) => hitIds.has(element.elementId)) : elements;
@@ -180,19 +428,41 @@ export function WinAppsPanel() {
     setPending(null);
     setSearchResult(null);
     setSearchError(null);
+    setElementsSnapshot(null);
     revisionRef.current = undefined;
     revisionWindowRef.current = selected?.windowId ?? null;
-  }, [selected?.windowId]);
+  }, [selected?.windowId, selected?.windowToken]);
 
   useEffect(() => {
-    setPos((current) => current.left === 0 && current.top === 0 && typeof window !== "undefined"
-      ? { ...current, left: Math.max(16, window.innerWidth - 480), top: 220 }
-      : current);
+    const initialize = () => setPos((current) => {
+      const initial = current.left === 0 && current.top === 0
+        ? { ...current, left: Math.max(12, window.innerWidth - 480), top: 220 }
+        : current;
+      return constrainPanel(initial, window.innerWidth, window.innerHeight);
+    });
+    const resize = () => setPos((current) => constrainPanel(current, window.innerWidth, window.innerHeight));
+    initialize();
+    window.addEventListener("resize", resize);
+    return () => window.removeEventListener("resize", resize);
   }, []);
 
   useEffect(() => {
     if (selected && selected.windowId !== windowId) setWindowId(selected.windowId);
   }, [selected, windowId]);
+
+  useEffect(() => {
+    displaySequenceRef.current += 1;
+    snapshotControllerRef.current?.abort();
+    snapshotControllerRef.current = null;
+    snapshotInFlightRef.current = false;
+    if (shotRef.current) URL.revokeObjectURL(shotRef.current);
+    shotRef.current = null;
+    setShot(null);
+    setShotWindowId(null);
+    setShotWindowToken(null);
+    setShotError(null);
+    setStreamState("on");
+  }, [selected?.windowId, selected?.windowToken]);
 
   useEffect(() => {
     const update = () => setVisible(!document.hidden);
@@ -201,46 +471,103 @@ export function WinAppsPanel() {
   }, []);
 
   useEffect(() => {
-    if (!armedByThisPanel) return;
-    const disarm = () => {
-      void fetch("/api/labs/winapps/control", {
+    const node = mirrorRef.current;
+    if (!node) return;
+    const observer = new ResizeObserver((entries) => {
+      const box = entries[0]?.contentRect;
+      if (box) setMirrorSize({ width: box.width, height: box.height });
+    });
+    observer.observe(node);
+    const box = node.getBoundingClientRect();
+    setMirrorSize({ width: box.width, height: box.height });
+    return () => observer.disconnect();
+  }, [selected?.windowId, selected?.windowToken]);
+
+  useEffect(() => {
+    const query = window.matchMedia("(pointer: coarse)");
+    const update = () => setCoarsePointer(query.matches);
+    update();
+    query.addEventListener("change", update);
+    return () => query.removeEventListener("change", update);
+  }, []);
+
+  const disarmOwnedLock = useCallback(() => {
+    if (!ownerArmedRef.current) return;
+    ownerArmedRef.current = false;
+    void fetch("/api/labs/winapps/control", {
         method: "POST",
         headers: { "Content-Type": "application/json", "X-OSLab": "1" },
         body: JSON.stringify({ armed: false, owner: ownerRef.current }),
         keepalive: true
-      }).catch(() => undefined);
-    };
-    window.addEventListener("pagehide", disarm);
-    return () => window.removeEventListener("pagehide", disarm);
-  }, [armedByThisPanel]);
+      }).catch(() => {
+        ownerArmedRef.current = true;
+      });
+  }, []);
 
-  const setShotFromBytes = useCallback((png: Uint8Array) => {
-    grabSeq.current += 1;
+  useEffect(() => {
+    window.addEventListener("pagehide", disarmOwnedLock);
+    return () => {
+      window.removeEventListener("pagehide", disarmOwnedLock);
+      disarmOwnedLock();
+    };
+  }, [disarmOwnedLock]);
+
+  const setShotFromBytes = useCallback((
+    targetWindowId: number,
+    targetWindowToken: string,
+    png: Uint8Array,
+    isCurrent: () => boolean
+  ) => {
+    if (!isCurrent() || selectedWindowIdRef.current !== targetWindowId
+      || selectedWindowTokenRef.current !== targetWindowToken) return;
+    validatePngFrame(png);
     const url = URL.createObjectURL(new Blob([png.slice().buffer as ArrayBuffer], { type: "image/png" }));
     if (shotRef.current) URL.revokeObjectURL(shotRef.current);
     shotRef.current = url;
     setShot(url);
+    setShotWindowId(targetWindowId);
+    setShotWindowToken(targetWindowToken);
     setShotError(null);
   }, []);
 
   const grab = useCallback(async () => {
-    if (!selected || hidden) return;
-    const sequence = ++grabSeq.current;
+    const targetWindowId = selected?.windowId;
+    const targetWindowToken = selected?.windowToken;
+    if (!targetWindowId || !targetWindowToken || hidden || snapshotInFlightRef.current) return;
+    snapshotInFlightRef.current = true;
+    const sequence = ++displaySequenceRef.current;
+    const controller = new AbortController();
+    snapshotControllerRef.current = controller;
+    const timeout = setTimeout(() => controller.abort(), STREAM_CONNECT_TIMEOUT_MS);
     try {
-      const response = await fetch(api.winappsAppScreenshotUrl(selected.windowId), { cache: "no-store" });
+      const response = await fetch(api.winappsAppScreenshotUrl(targetWindowId, targetWindowToken), {
+        cache: "no-store",
+        signal: controller.signal
+      });
       if (!response.ok) {
         const body = (await response.json().catch(() => ({}))) as { error?: string };
         throw new Error(body.error || `${response.status} ${response.statusText}`);
       }
       const png = new Uint8Array(await response.arrayBuffer());
-      if (sequence !== grabSeq.current) return;
-      setShotFromBytes(png);
+      setShotFromBytes(targetWindowId, targetWindowToken, png, () =>
+        sequence === displaySequenceRef.current && selectedWindowIdRef.current === targetWindowId
+        && selectedWindowTokenRef.current === targetWindowToken
+      );
     } catch (e) {
-      if (sequence !== grabSeq.current) return;
+      if (sequence !== displaySequenceRef.current || selectedWindowIdRef.current !== targetWindowId
+        || selectedWindowTokenRef.current !== targetWindowToken) return;
       setShot(null);
+      setShotWindowId(null);
+      setShotWindowToken(null);
       setShotError(message(e));
+    } finally {
+      clearTimeout(timeout);
+      if (snapshotControllerRef.current === controller) {
+        snapshotControllerRef.current = null;
+        snapshotInFlightRef.current = false;
+      }
     }
-  }, [hidden, selected?.windowId, setShotFromBytes]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [hidden, selected?.windowId, selected?.windowToken, setShotFromBytes]);
 
   useEffect(() => () => {
     if (shotRef.current) URL.revokeObjectURL(shotRef.current);
@@ -250,7 +577,7 @@ export function WinAppsPanel() {
     if (!selected || hidden) return;
     setStreamState("on");
     void grab();
-  }, [selected?.windowId, hidden, grab]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selected?.windowId, selected?.windowToken, hidden, grab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!selected || hidden || streamState !== "failed") return;
@@ -258,41 +585,80 @@ export function WinAppsPanel() {
       if (!document.hidden) void grab();
     }, MIRROR_INTERVAL);
     return () => clearInterval(timer);
-  }, [selected?.windowId, hidden, streamState, grab]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [selected?.windowId, selected?.windowToken, hidden, streamState, grab]); // eslint-disable-line react-hooks/exhaustive-deps
 
   useEffect(() => {
     if (!selected || hidden || streamState !== "on" || !visible) return;
+    const targetWindowId = selected.windowId;
+    const targetWindowToken = selected.windowToken;
+    const generation = ++streamGenerationRef.current;
+    let active = true;
+    let connected = false;
+    let timedOut = false;
     const controller = new AbortController();
+    const connectionTimer = setTimeout(() => {
+      if (!connected) {
+        timedOut = true;
+        controller.abort();
+      }
+    }, STREAM_CONNECT_TIMEOUT_MS);
     (async () => {
       try {
-        const response = await fetch(api.winappsAppStreamUrl(selected.windowId, fps), {
+        const response = await fetch(api.winappsAppStreamUrl(targetWindowId, fps, targetWindowToken), {
           signal: controller.signal,
           cache: "no-store"
         });
+        connected = true;
+        clearTimeout(connectionTimer);
         if (!response.ok) {
           const body = (await response.json().catch(() => ({}))) as { error?: string };
           throw new Error(body.error || `${response.status} ${response.statusText}`);
         }
-        await pumpPngStream(response, setShotFromBytes);
+        await pumpPngStream(response, (png) => {
+          if (!active || streamGenerationRef.current !== generation
+            || selectedWindowIdRef.current !== targetWindowId
+            || selectedWindowTokenRef.current !== targetWindowToken) return;
+          const sequence = ++displaySequenceRef.current;
+          setShotFromBytes(targetWindowId, targetWindowToken, png, () =>
+            active && streamGenerationRef.current === generation
+            && selectedWindowIdRef.current === targetWindowId
+            && selectedWindowTokenRef.current === targetWindowToken
+            && displaySequenceRef.current === sequence
+          );
+        });
         throw new Error("The mirror stream ended");
       } catch (e) {
-        if ((e as Error).name === "AbortError") return;
-        setShot(null);
-        setShotError(message(e));
+        if (!active || streamGenerationRef.current !== generation
+          || selectedWindowIdRef.current !== targetWindowId
+          || selectedWindowTokenRef.current !== targetWindowToken) return;
+        controller.abort();
+        setShotError(timedOut ? "The mirror stream connection timed out" : message(e));
         setStreamState("failed");
       }
     })();
-    return () => controller.abort();
-  }, [selected?.windowId, hidden, streamState, visible, fps, setShotFromBytes]);
+    return () => {
+      active = false;
+      clearTimeout(connectionTimer);
+      controller.abort();
+      if (streamGenerationRef.current === generation) streamGenerationRef.current += 1;
+    };
+  }, [selected?.windowId, selected?.windowToken, hidden, streamState, visible, fps, setShotFromBytes]);
 
   const searchElements = async (event: React.FormEvent<HTMLFormElement>) => {
     event.preventDefault();
     if (!selected) return;
     setShowElements(true);
     setSearchError(null);
+    const target = selected;
     try {
-      const result = await api.winappsSearch(selected.windowId, query);
-      setSearchResult({ windowId: result.windowId, query: result.query, hits: result.hits });
+      const result = await api.winappsSearch(target.windowId, query, target.windowToken);
+      if (selectedWindowIdRef.current !== target.windowId
+        || selectedWindowTokenRef.current !== target.windowToken
+        || result.windowToken !== target.windowToken) return;
+      setSearchResult({
+        windowId: result.windowId, windowToken: result.windowToken, revision: result.revision,
+        query: result.query, hits: result.hits
+      });
     } catch (e) {
       setSearchResult(null);
       setSearchError(message(e));
@@ -304,7 +670,9 @@ export function WinAppsPanel() {
     setControlBusy(true);
     setActionError(null);
     try {
-      await api.winappsControlArm(!armedByThisPanel, ownerRef.current);
+      const nextArmed = !armedByThisPanel;
+      await api.winappsControlArm(nextArmed, ownerRef.current);
+      ownerArmedRef.current = nextArmed;
       control.reload();
     } catch (e) {
       setActionError(message(e));
@@ -318,6 +686,7 @@ export function WinAppsPanel() {
     setActionError(null);
     try {
       await api.winappsStop();
+      ownerArmedRef.current = false;
       setPending(null);
       control.reload();
     } catch (e) {
@@ -327,53 +696,122 @@ export function WinAppsPanel() {
     }
   };
 
-  const previewClick = (x: number, y: number, element?: WinElement) => {
+  const actionBinding = (snapshot: WinElementsInfo, element: WinElement): WinActionBinding => ({
+    windowId: snapshot.windowId,
+    windowToken: snapshot.windowToken,
+    revision: snapshot.revision,
+    elementId: element.elementId,
+    elementBounds: elementBounds(element),
+    owner: ownerRef.current,
+    actionId: actionId(),
+    confirm: true
+  });
+
+  const previewClick = async (x: number, y: number, preferred?: WinElement) => {
     if (!selected || !shot) return;
+    const targetWindow = selected;
+    setPreviewBusy(true);
     setActionError(null);
-    const target = { windowId: selected.windowId, x: Math.round(x), y: Math.round(y), element };
-    if (mouseAction === "scroll_up" || mouseAction === "scroll_down") {
+    try {
+      const snapshot = await requestElements();
+      if (!snapshot || snapshot.windowId !== targetWindow.windowId
+        || snapshot.windowToken !== targetWindow.windowToken
+        || selectedWindowIdRef.current !== targetWindow.windowId
+        || selectedWindowTokenRef.current !== targetWindow.windowToken) {
+        throw new Error("The selected window changed; refresh the mirror and preview again.");
+      }
+      const candidates = snapshot.elements.filter((element) => {
+        if (!element.enabled) return false;
+        if (preferred) return element.elementId === preferred.elementId;
+        return x >= element.x && x <= element.x + element.w
+          && y >= element.y && y <= element.y + element.h;
+      }).sort((a, b) => a.w * a.h - b.w * b.h);
+      const element = candidates[0];
+      if (!element) throw new Error("Select a visible UI Automation hotspot before previewing a click.");
+      if (preferred && (preferred.x !== element.x || preferred.y !== element.y
+        || preferred.w !== element.w || preferred.h !== element.h)) {
+        throw new Error("The UI Automation control moved; select it again before previewing.");
+      }
+      const deltaY = mouseAction === "scroll" ? clamp(scrollDeltaY, -MAX_SCROLL_DELTA, MAX_SCROLL_DELTA) : 0;
+      if (mouseAction === "scroll" && deltaY === 0) {
+        throw new Error("Choose a non-zero scroll amount before previewing.");
+      }
       setPending({
-        kind: "scroll", ...target, deltaX: 0, deltaY: mouseAction === "scroll_up" ? 120 : -120
+        ...actionBinding(snapshot, element),
+        kind: "click",
+        x: Math.round(element.x + element.w / 2),
+        y: Math.round(element.y + element.h / 2),
+        element,
+        action: mouseAction,
+        deltaX: 0,
+        deltaY
       });
-    } else {
-      setPending({ kind: mouseAction, ...target });
+    } catch (e) {
+      setActionError(message(e));
+    } finally {
+      setPreviewBusy(false);
+    }
+  };
+
+  const previewInput = async (kind: "type" | "key") => {
+    if (!selected) return;
+    const targetWindow = selected;
+    setPreviewBusy(true);
+    setActionError(null);
+    try {
+      const snapshot = await requestElements();
+      if (!snapshot || snapshot.windowId !== targetWindow.windowId
+        || snapshot.windowToken !== targetWindow.windowToken
+        || selectedWindowIdRef.current !== targetWindow.windowId
+        || selectedWindowTokenRef.current !== targetWindow.windowToken) {
+        throw new Error("The selected window changed; refresh the mirror and preview again.");
+      }
+      const element = snapshot.elements.find((candidate) => candidate.focused && candidate.enabled);
+      if (!element) throw new Error("Focus a visible UI Automation control before previewing keyboard input.");
+      const binding = actionBinding(snapshot, element);
+      setPending(kind === "type"
+        ? { ...binding, kind, text: inputText }
+        : { ...binding, kind, key: inputKey });
+    } catch (e) {
+      setActionError(message(e));
+    } finally {
+      setPreviewBusy(false);
     }
   };
 
   const confirmPending = async () => {
-    if (!pending || !armedByThisPanel || controlBusy) return;
+    if (!pending || !armedByThisPanel || controlBusy || !selected
+      || pending.windowId !== selected.windowId || pending.windowToken !== selected.windowToken) return;
     setControlBusy(true);
     setActionError(null);
+    const binding: WinActionBinding = {
+      windowId: pending.windowId,
+      windowToken: pending.windowToken,
+      revision: pending.revision,
+      elementId: pending.elementId,
+      elementBounds: pending.elementBounds,
+      owner: ownerRef.current,
+      actionId: pending.actionId,
+      confirm: true
+    };
     try {
       if (pending.kind === "click") {
         await api.winappsClick({
-          windowId: pending.windowId, x: pending.x, y: pending.y,
-          owner: ownerRef.current, confirm: true
-        });
-      } else if (pending.kind === "double_click" || pending.kind === "right_click") {
-        await api.winappsInput({
-          windowId: pending.windowId, kind: pending.kind, x: pending.x, y: pending.y,
-          owner: ownerRef.current, confirm: true
-        });
-      } else if (pending.kind === "scroll") {
-        await api.winappsInput({
-          windowId: pending.windowId, kind: "scroll", x: pending.x, y: pending.y,
-          deltaX: pending.deltaX, deltaY: pending.deltaY, owner: ownerRef.current, confirm: true
+          ...binding, x: pending.x, y: pending.y,
+          action: pending.action, deltaX: pending.deltaX, deltaY: pending.deltaY
         });
       } else if (pending.kind === "type") {
         await api.winappsInput({
-          windowId: pending.windowId, kind: "type", text: pending.text,
-          owner: ownerRef.current, confirm: true
+          ...binding, kind: "type", text: pending.text
         });
       } else {
         await api.winappsInput({
-          windowId: pending.windowId, kind: "key", key: pending.key,
-          owner: ownerRef.current, confirm: true
+          ...binding, kind: "key", key: pending.key
         });
       }
       setPending(null);
       control.reload();
-      if (showElements) reloadElements();
+      if (showElements) void requestElements();
     } catch (e) {
       setActionError(message(e));
       control.reload();
@@ -387,6 +825,7 @@ export function WinAppsPanel() {
       setControlBusy(true);
       try {
         await api.winappsControlArm(false, ownerRef.current);
+        ownerArmedRef.current = false;
         control.reload();
       } catch (e) {
         setActionError(message(e));
@@ -406,8 +845,10 @@ export function WinAppsPanel() {
     const move = (pointer: PointerEvent) => {
       setPos((current) => ({
         ...current,
-        left: clamp(origin.left + pointer.clientX - origin.x, 0, window.innerWidth - MIN_WIDTH),
-        top: clamp(origin.top + pointer.clientY - origin.y, 0, window.innerHeight - 120)
+        left: clamp(origin.left + pointer.clientX - origin.x, 12,
+          Math.max(12, window.innerWidth - current.width - 12)),
+        top: clamp(origin.top + pointer.clientY - origin.y, 12,
+          Math.max(12, window.innerHeight - current.height - 12))
       }));
     };
     const up = () => {
@@ -424,11 +865,15 @@ export function WinAppsPanel() {
     event.stopPropagation();
     const origin = { x: event.clientX, y: event.clientY, width: pos.width, height: pos.height };
     const move = (pointer: PointerEvent) => {
-      setPos((current) => ({
-        ...current,
-        width: clamp(origin.width + pointer.clientX - origin.x, MIN_WIDTH, window.innerWidth - 24),
-        height: clamp(origin.height + pointer.clientY - origin.y, MIN_HEIGHT, window.innerHeight - 24)
-      }));
+      setPos((current) => {
+        const maxWidth = Math.max(1, window.innerWidth - current.left - 12);
+        const maxHeight = Math.max(1, window.innerHeight - current.top - 12);
+        return {
+          ...current,
+          width: clamp(origin.width + pointer.clientX - origin.x, Math.min(MIN_WIDTH, maxWidth), maxWidth),
+          height: clamp(origin.height + pointer.clientY - origin.y, Math.min(MIN_HEIGHT, maxHeight), maxHeight)
+        };
+      });
     };
     const up = () => {
       window.removeEventListener("pointermove", move);
@@ -440,7 +885,7 @@ export function WinAppsPanel() {
 
   const header = (
     <div
-      className={`flex items-center gap-2 border-b border-(--iux-border) px-4 py-2.5 ${float ? "cursor-move touch-none select-none" : ""}`}
+      className={`flex flex-wrap items-center gap-2 border-b border-(--iux-border) px-4 py-2.5 ${float ? "cursor-move touch-none select-none" : ""}`}
       onPointerDown={startDrag}
     >
       <EyeIcon size={15} className="text-[#f36c21]" aria-hidden />
@@ -470,6 +915,8 @@ export function WinAppsPanel() {
     </div>
   );
 
+  const currentShot = selected && shotWindowId === selected.windowId
+    && shotWindowToken === selected.windowToken ? shot : null;
   const body = (
     <div className="flex flex-col gap-3">
       {error ? <Status value={{ ok: false, text: error }} /> : null}
@@ -477,6 +924,7 @@ export function WinAppsPanel() {
       {actionError ? <Status value={{ ok: false, text: actionError }} /> : null}
       {elementsError ? <Status value={{ ok: false, text: elementsError }} /> : null}
       {searchError ? <Status value={{ ok: false, text: searchError }} /> : null}
+      {streamState === "failed" && shotError ? <Status value={{ ok: false, text: shotError }} /> : null}
       {!data ? (
         <Skeleton rows={2} />
       ) : !data.available ? (
@@ -505,7 +953,10 @@ export function WinAppsPanel() {
               <ArrowClockwiseIcon size={14} /> Refresh
             </button>
             <button type="button" className="iux-btn" data-variant={showElements ? undefined : "outline"}
-              aria-pressed={showElements} onClick={() => setShowElements((current) => !current)}>
+              aria-pressed={showElements} onClick={() => {
+                setShowElements((current) => !current);
+                if (!showElements) void requestElements().catch((e) => setActionError(message(e)));
+              }}>
               <EyeIcon size={14} /> Elements
             </button>
             <button type="button" className={armedByThisPanel ? "iux-btn bg-[#f36c21] text-white hover:bg-[#fa7b32]" : "iux-btn"}
@@ -555,15 +1006,23 @@ export function WinAppsPanel() {
                 ))}
               </select>
             </Field>
+            {mouseAction === "scroll" ? (
+              <Field label="Scroll amount">
+                <input className="iux-input" type="number" min={-MAX_SCROLL_DELTA} max={MAX_SCROLL_DELTA}
+                  step={120} value={scrollDeltaY} aria-label="Scroll amount"
+                  onChange={(event) => {
+                    const value = Number(event.target.value);
+                    setScrollDeltaY(Number.isFinite(value) ? clamp(value, -MAX_SCROLL_DELTA, MAX_SCROLL_DELTA) : 0);
+                  }} />
+              </Field>
+            ) : null}
             <div className="flex items-end gap-2">
               <Field label="Text to type">
                 <input className="iux-input" value={inputText} maxLength={200} aria-label="Text to type"
                   onChange={(event) => setInputText(event.target.value)} />
               </Field>
               <button type="button" className="iux-btn shrink-0" data-variant="outline"
-                disabled={!inputText.length} onClick={() => selected && setPending({
-                  kind: "type", windowId: selected.windowId, text: inputText
-                })}>
+                disabled={!inputText.length || previewBusy} onClick={() => void previewInput("type")}>
                 Preview text
               </button>
             </div>
@@ -575,16 +1034,16 @@ export function WinAppsPanel() {
                 </select>
               </Field>
               <button type="button" className="iux-btn shrink-0" data-variant="outline"
-                onClick={() => selected && setPending({ kind: "key", windowId: selected.windowId, key: inputKey })}>
+                disabled={previewBusy} onClick={() => void previewInput("key")}>
                 Preview key
               </button>
             </div>
           </div>
-          <section aria-label="Recent actions" className="rounded-lg border border-(--iux-border) px-3 py-2">
-            <p className="mb-1 text-xs font-semibold">Recent actions</p>
-            {recentActions.length ? (
+          {((controlState?.recentActions?.length ?? 0) > 0 || (controlState?.audit?.length ?? 0) > 0) ? (
+            <section aria-label="Recent actions" className="rounded-lg border border-(--iux-border) p-2">
+              <h3 className="mb-1 text-xs font-semibold">Recent actions</h3>
               <ol className="flex flex-col gap-1">
-                {recentActions.slice(-6).reverse().map((row, index) => (
+                {(controlState?.recentActions ?? controlState?.audit ?? []).slice(-6).reverse().map((row, index) => (
                   <li key={`${row.time}-${row.kind}-${index}`} className="flex items-center gap-2 text-xs">
                     <span className="min-w-0 flex-1 truncate">
                       {auditLabel(row)}{row.key ? ` · ${row.key}` : ""}{row.app ? ` · ${row.app}` : ""}
@@ -598,9 +1057,10 @@ export function WinAppsPanel() {
                   </li>
                 ))}
               </ol>
-            ) : <p className="text-xs text-(--iux-muted-foreground)">No actions yet.</p>}
-          </section>
+            </section>
+          ) : null}
           <div
+            ref={mirrorRef}
             className="relative w-full cursor-crosshair overflow-hidden rounded-xl border border-(--iux-border) bg-black"
             style={{
               aspectRatio: `${selected.width || 4} / ${selected.height || 3}`,
@@ -610,7 +1070,7 @@ export function WinAppsPanel() {
             onClick={(event) => {
               const rect = event.currentTarget.getBoundingClientRect();
               if (!rect.width || !rect.height) return;
-              previewClick(
+              void previewClick(
                 (event.clientX - rect.left) * selected.width / rect.width,
                 (event.clientY - rect.top) * selected.height / rect.height
               );
@@ -618,9 +1078,9 @@ export function WinAppsPanel() {
             onPointerEnter={() => setHovering(true)}
             onPointerLeave={() => setHovering(false)}
           >
-            {shot ? (
+            {currentShot ? (
               <img
-                src={shot}
+                src={currentShot}
                 alt={`Mirror of ${selected.app}`}
                 className="absolute inset-0 h-full w-full object-fill"
                 draggable={false}
@@ -634,6 +1094,7 @@ export function WinAppsPanel() {
                   data-variant="outline"
                   onClick={() => {
                     setStreamState("on");
+                    setShotError(null);
                     void grab();
                   }}
                 >
@@ -645,27 +1106,42 @@ export function WinAppsPanel() {
                 <CircleNotchIcon size={22} className="animate-spin text-zinc-500" aria-hidden />
               </div>
             )}
-            {showElements && shot ? visibleElements.map((element, index) => (
-              <button
-                key={element.elementId}
-                type="button"
-                className={`absolute rounded-md border text-[10px] font-semibold ${
-                  element.focused
-                    ? "border-violet-400/80 bg-violet-400/20 text-violet-100"
-                    : element.enabled
-                      ? "border-[#f36c21]/80 bg-[#f36c21]/20 text-[#ffcfaa] hover:bg-[#f36c21]/40"
-                      : "border-zinc-400/70 bg-zinc-400/15 text-zinc-300"
-                }`}
-                style={hotspotStyle(element, selected)}
-                title={`${element.role}${element.label ? `: ${element.label}` : ""}`}
-                aria-label={`${element.role}${element.label ? `: ${element.label}` : ""}`}
-                onClick={(event) => {
-                  event.stopPropagation();
-                  previewClick(element.x + element.w / 2, element.y + element.h / 2, element);
-                }}
-              >
-                {element.w > 24 && element.h > 14 ? index + 1 : null}
-              </button>
+            {showElements && currentShot ? visibleElements.map((element, index) => (
+              (() => {
+                const styles = hotspotStyles(element, elements, selected, mirrorSize, coarsePointer);
+                return (
+                  <button
+                    key={element.elementId}
+                    type="button"
+                    data-testid="winapps-hotspot"
+                    data-element-id={element.elementId}
+                    className="absolute z-10 rounded-md border-0 bg-transparent p-0"
+                    style={styles.hit}
+                    title={`${element.role}${element.label ? `: ${element.label}` : ""}`}
+                    aria-label={`${element.role}${element.label ? `: ${element.label}` : ""}`}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      void previewClick(element.x + element.w / 2, element.y + element.h / 2, element);
+                    }}
+                  >
+                    <span
+                      data-testid="winapps-hotspot-visible"
+                      data-element-id={element.elementId}
+                      aria-hidden="true"
+                      className={`absolute flex items-center justify-center rounded-md border text-[10px] font-semibold pointer-events-none ${
+                        element.focused
+                          ? "border-violet-400/80 bg-violet-400/20 text-violet-100"
+                          : element.enabled
+                            ? "border-[#f36c21]/80 bg-[#f36c21]/20 text-[#ffcfaa]"
+                            : "border-zinc-400/70 bg-zinc-400/15 text-zinc-300"
+                      }`}
+                      style={styles.visible}
+                    >
+                      {element.w > 24 && element.h > 14 ? index + 1 : null}
+                    </span>
+                  </button>
+                );
+              })()
             )) : null}
           </div>
           {showElements && !elements.length && !elementsError ? (
@@ -682,22 +1158,22 @@ export function WinAppsPanel() {
       onClose={() => setPending(null)}>
       <div className="flex flex-col gap-3 px-6 pb-5">
         <p className="text-sm font-medium">
-          {pending.kind === "click"
-            ? pending.element
-              ? <><span>Click UI element</span>: {pending.element.role}{pending.element.label ? `: ${pending.element.label}` : ""}</>
-              : <><span>Click at</span> <code>{pending.x}, {pending.y}</code></>
-            : pending.kind === "double_click" || pending.kind === "right_click"
-              ? pending.element
-                ? <><span>{pending.kind === "double_click" ? "Double-click UI element" : "Right-click UI element"}</span>
-                  : {pending.element.role}{pending.element.label ? `: ${pending.element.label}` : ""}</>
-                : <><span>{pending.kind === "double_click" ? "Double-click at" : "Right-click at"}</span>
-                  <code>{pending.x}, {pending.y}</code></>
-              : pending.kind === "scroll"
-                ? <><span>Scroll at</span> <code>{pending.x}, {pending.y}</code>
-                  <span> ({pending.deltaY > 0 ? "up" : "down"})</span></>
-                : pending.kind === "type" ? <span>Type this text into the focused control</span>
-                  : <><span>Press key</span> <code>{pending.key}</code></>}
+          {pending.kind === "click" ? (
+            <>
+              <span>{pending.action === "double_click" ? "Double-click UI element"
+                : pending.action === "right_click" ? "Right-click UI element"
+                  : pending.action === "scroll" ? "Scroll UI element" : "Click UI element"}: </span>
+              {pending.element.role}{pending.element.label ? `: ${pending.element.label}` : ""}
+            </>
+          ) : pending.kind === "type" ? (
+            <span>Type this text into the focused control</span>
+          ) : (
+            <><span>Press key</span> <code>{pending.key}</code></>
+          )}
         </p>
+        {pending.kind === "click" && pending.action === "scroll" ? (
+          <p className="text-xs">{`Scroll delta: ${pending.deltaY}`}</p>
+        ) : null}
         {pending.kind === "type" ? (
           <pre className="max-h-32 overflow-auto whitespace-pre-wrap rounded-md border border-(--iux-border) p-3 text-xs">{pending.text}</pre>
         ) : null}
@@ -740,7 +1216,10 @@ export function WinAppsPanel() {
   return float ? (
     <div
       className="iux-card fixed z-40 flex flex-col overflow-hidden shadow-[0_18px_50px_-12px_rgba(0,0,0,0.55)]"
-      style={{ left: pos.left, top: pos.top, width: pos.width, height: pos.height }}
+      style={{
+        left: pos.left, top: pos.top, width: pos.width, height: pos.height,
+        maxWidth: "calc(100vw - 24px)", maxHeight: "calc(100dvh - 24px)"
+      }}
     >
       {header}
       <div className="min-h-0 flex-1 overflow-y-auto px-4 py-3">{body}</div>

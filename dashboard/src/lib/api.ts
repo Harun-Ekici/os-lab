@@ -118,6 +118,26 @@ export interface LabPlan {
   display: string;
 }
 export type JobState = "running" | "succeeded" | "failed" | "cancelled" | "timed-out" | "interrupted";
+/** One device row of `console/frida_inventory.py` (schema oslab.frida-inventory/1). */
+export interface FridaDevice {
+  id: string;
+  type: string;
+  transport: "local" | "USB" | "TCP";
+  name: string;
+  os: string | null;
+  processes: { pid: number | null; name: string; identifier?: string }[] | null;
+  processCount: number | null;
+  error: string | null;
+}
+export interface FridaInventory {
+  schema: string;
+  generatedAt: string;
+  backend: string | null;
+  devices: FridaDevice[];
+  summary: { devices: number; usb: number; tcp: number; processes: number };
+  errors: { stage: string; device?: string; message: string }[];
+}
+
 export interface LabJob {
   id: string;
   label: string;
@@ -358,6 +378,8 @@ export interface MacSearchInfo {
 export interface WinApp {
   /** Stable HWND; Windows can reuse an HWND only after the window is gone. */
   windowId: number;
+  /** Opaque process/thread/window identity; changes if Windows reuses the HWND. */
+  windowToken: string;
   pid: number;
   app: string;
   /** Whether the owning process is elevated; null when Windows would not report it. */
@@ -394,6 +416,7 @@ export interface WinElementDiff {
 }
 export interface WinElementsInfo {
   windowId: number;
+  windowToken: string;
   app: string;
   bounds: { x: number; y: number; width: number; height: number };
   revision: string;
@@ -404,6 +427,7 @@ export interface WinElementsInfo {
 }
 export interface WinSearchInfo {
   windowId: number;
+  windowToken: string;
   app: string;
   revision: string;
   engine: "uia";
@@ -415,12 +439,14 @@ export interface WinControlState {
   armed: boolean;
   owner: string | null;
   expiresInSec: number;
-  recentActions: WinAuditRow[];
+  audit?: WinAuditRow[];
+  recentActions?: WinAuditRow[];
 }
 export interface WinAuditRow {
   time: number;
   kind: string;
   action?: string;
+  actionId?: string;
   windowId?: number;
   app?: string;
   x?: number;
@@ -430,10 +456,37 @@ export interface WinAuditRow {
   textLength?: number;
   key?: string;
   ok?: boolean;
+  reason?: string;
 }
 export type WinInputKind = "type" | "key" | "double_click" | "right_click" | "scroll";
 export type WinInputKey = "tab" | "escape" | "backspace" | "delete" | "up" | "down" | "left" | "right" | "enter";
-export type WinInputRequest = {
+export interface WinActionBinding {
+  windowId: number;
+  windowToken: string;
+  revision: string;
+  elementId: string;
+  elementBounds: Pick<WinElement, "x" | "y" | "w" | "h">;
+  owner: string;
+  actionId: string;
+  confirm: true;
+}
+export interface WinClickAction extends WinActionBinding {
+  x: number;
+  y: number;
+  action?: "click" | "double_click" | "right_click" | "scroll";
+  deltaX?: number;
+  deltaY?: number;
+}
+export interface WinInputAction extends WinActionBinding {
+  kind: WinInputKind;
+  text?: string;
+  key?: WinInputKey;
+  x?: number;
+  y?: number;
+  deltaX?: number;
+  deltaY?: number;
+}
+export type WinInputRequest = WinInputAction | ({
   windowId: number;
   owner: string;
   confirm: true;
@@ -442,7 +495,7 @@ export type WinInputRequest = {
   | { kind: "key"; key: WinInputKey }
   | { kind: "double_click" | "right_click"; x: number; y: number }
   | { kind: "scroll"; x: number; y: number; deltaX: number; deltaY: number }
-);
+));
 export interface Report {
   name: string;
   url: string;
@@ -532,24 +585,39 @@ export interface CleanupPermissions {
 }
 /** CLNP-09/10: one configured volume of the background monitor. */
 export interface CleanupMonitorVolumeConfig {
-  mountPoint: string; minFreeBytes: number; minFreePercent: number; enabled: boolean;
+  mountPoint: string; minFreeBytes: number; minFreePercent: number; criticalFreeBytes?: number | null; enabled: boolean;
   volume: { freeBytes: number | null; totalBytes: number | null; usage: number | null; kind: string | null } | null;
 }
 export interface CleanupMonitorStatus {
   enabled: boolean; running: boolean; intervalSeconds: number; cooldownSeconds: number;
+  /** CUX-07: repeat a standing warning after this long (0 = never) and notify outside the window. */
+  reminderSeconds?: number; notify?: boolean;
   volumes: CleanupMonitorVolumeConfig[];
   state: {
     volumes: Record<string, { armed: boolean; lastWarningAt: number | null; state: string }>;
     events: { at: number; kind: string; volume: string | null; freeBytes: number | null; thresholdBytes: number | null; message: string }[];
     lastEvaluationAt: number | null; lastError: string | null;
   };
-  activeWarnings: { volume: string; lastWarningAt: number | null }[];
+  activeWarnings: { volume: string; lastWarningAt: number | null; level?: "warning" | "critical" }[];
   configError: string | null;
   checkedAt: number;
 }
 export interface CleanupMonitorConfig {
-  enabled: boolean; intervalSeconds: number; cooldownSeconds: number;
-  volumes: { mountPoint: string; minFreeBytes: number; minFreePercent: number; enabled: boolean }[];
+  enabled: boolean; intervalSeconds: number; cooldownSeconds: number; reminderSeconds?: number; notify?: boolean;
+  volumes: { mountPoint: string; minFreeBytes: number; minFreePercent: number; criticalFreeBytes?: number | null; enabled: boolean }[];
+}
+/** CUX-08: the saved suggestion preferences and what a scan suggests under them. */
+export interface CleanupSuggestionPrefs {
+  mode: "auto" | "recommended" | "extended"; include: string[]; exclude: string[];
+  minEntryBytes: number; targetFreeBytes: number | null;
+}
+export interface CleanupPreferences { suggestion: CleanupSuggestionPrefs; configError: string | null }
+export interface CleanupSuggestion {
+  mode: CleanupSuggestionPrefs["mode"];
+  items: { id: string; name: string; bytes: number; risk: string; reason: string }[];
+  totalBytes: number;
+  pressure: { underPressure: boolean; freeBytes: number | null; targetFreeBytes: number | null; shortfallBytes: number; covers: boolean; remainingBytes: number };
+  skipped: { id: string; reason: string }[]; ignoredIds: string[]; configError: string | null;
 }
 /** CLNP-23: one registered Space Explorer root. */
 export interface CleanupExplorerRoot {
@@ -754,6 +822,10 @@ export const api = {
   cleanupResetPermission: () => post<{ reset: string }>("/api/cleanup/permissions/reset", {}),
   cleanupMonitor: () => call<CleanupMonitorStatus>("/api/cleanup/monitor"),
   cleanupMonitorConfig: (config: CleanupMonitorConfig) => post<CleanupMonitorStatus>("/api/cleanup/monitor/config", config),
+  cleanupPreferences: () => call<CleanupPreferences>("/api/cleanup/preferences"),
+  cleanupPreferencesSave: (suggestion: CleanupSuggestionPrefs) => post<CleanupPreferences>("/api/cleanup/preferences", { suggestion }),
+  cleanupSuggest: (jobId: string) => post<CleanupSuggestion>("/api/cleanup/suggest", { jobId }),
+  cleanupRevealEntry: (entryId: string) => post<{ revealed: string }>("/api/cleanup/entries/reveal", { entryId }),
   cleanupMonitorEvaluate: () => post<CleanupMonitorStatus>("/api/cleanup/monitor/evaluate"),
   cleanupVolumes: () => call<CleanupVolumes>("/api/cleanup/volumes"),
   /** CLN-27: relocatable entries and destination volumes, then plan → confirm → run. */
@@ -839,27 +911,34 @@ export const api = {
   macosAxPerform: (input: { pid: number; path: string; identity?: string; action: string; windowId?: number }) =>
     post<{ ok: boolean; actionSent: boolean }>("/api/labs/macos/element/perform", input),
   winappsApps: () => call<WinAppsInfo>("/api/labs/winapps/apps"),
-  winappsAppScreenshotUrl: (windowId: number) => `/api/labs/winapps/apps/${windowId}/screenshot`,
-  winappsAppStreamUrl: (windowId: number, fps: number) =>
-    `/api/labs/winapps/apps/${windowId}/stream?fps=${fps}`,
-  winappsElements: (windowId: number, revision?: string) =>
-    call<WinElementsInfo>(`/api/labs/winapps/apps/${windowId}/elements${revision ? `?revision=${encodeURIComponent(revision)}` : ""}`),
-  winappsSearch: (windowId: number, query: string) =>
-    call<WinSearchInfo>(`/api/labs/winapps/apps/${windowId}/search?q=${encodeURIComponent(query)}`),
+  winappsAppScreenshotUrl: (windowId: number, windowToken?: string) =>
+    `/api/labs/winapps/apps/${windowId}/screenshot${windowToken ? `?windowToken=${encodeURIComponent(windowToken)}` : ""}`,
+  winappsAppStreamUrl: (windowId: number, fps: number, windowToken?: string) =>
+    `/api/labs/winapps/apps/${windowId}/stream?fps=${fps}${windowToken ? `&windowToken=${encodeURIComponent(windowToken)}` : ""}`,
+  winappsElements: (windowId: number, revision?: string, windowToken?: string) => {
+    const query = new URLSearchParams();
+    if (revision) query.set("revision", revision);
+    if (windowToken) query.set("windowToken", windowToken);
+    const suffix = query.toString();
+    return call<WinElementsInfo>(`/api/labs/winapps/apps/${windowId}/elements${suffix ? `?${suffix}` : ""}`);
+  },
+  winappsSearch: (windowId: number, query: string, windowToken?: string) =>
+    call<WinSearchInfo>(`/api/labs/winapps/apps/${windowId}/search?q=${encodeURIComponent(query)}${windowToken ? `&windowToken=${encodeURIComponent(windowToken)}` : ""}`),
   winappsControl: () => call<WinControlState>("/api/labs/winapps/control"),
   winappsControlArm: (armed: boolean, owner?: string) =>
     post<WinControlState>("/api/labs/winapps/control", { armed, owner }),
-  winappsClick: (input: { windowId: number; x: number; y: number; owner: string; confirm: true }) =>
-    post<{ ok: boolean; actionSent: boolean; windowId: number; x: number; y: number }>("/api/labs/winapps/click", input),
+  winappsClick: (input: WinClickAction | { windowId: number; x: number; y: number; owner: string; confirm: true }) =>
+    post<{ ok: boolean; actionSent: boolean; windowId: number; x: number; y: number; action?: string; actionId?: string }>("/api/labs/winapps/click", input),
   winappsInput: (input: WinInputRequest) =>
-    post<{ ok: boolean; actionSent: boolean; windowId: number; kind: WinInputKind; action: WinInputKind; textLength: number;
-      key?: WinInputKey; x?: number; y?: number; deltaX?: number; deltaY?: number }>("/api/labs/winapps/input", input),
+    post<{ ok: boolean; actionSent: boolean; windowId: number; kind: WinInputKind; action?: WinInputKind; textLength?: number;
+      key?: WinInputKey; x?: number; y?: number; deltaX?: number; deltaY?: number; actionId?: string }>("/api/labs/winapps/input", input),
   winappsStop: () => post<{ ok: boolean; disarmed: boolean }>("/api/labs/winapps/stop", {}),
   plan: (request: LabRequest) => post<{ plan: LabPlan; token: string }>("/api/labs/plan", { request }),
   start: (request: LabRequest, token: string) => post<LabJob>("/api/labs/start", { request, token }),
   jobs: () => call<{ jobs: LabJob[] }>("/api/jobs"),
   job: (id: string) => call<LabJob>(`/api/jobs/${encodeURIComponent(id)}`),
   cancel: (id: string) => post<LabJob>(`/api/jobs/${encodeURIComponent(id)}/cancel`),
+  fridaInventory: (host = "") => call<FridaInventory>(`/api/frida/inventory${host ? `?host=${encodeURIComponent(host)}` : ""}`),
   // Android Lab workbench
   logs: () => call<AndroidLogs>("/api/logs"),
   clearLogs: () => post("/api/logs/clear"),

@@ -144,12 +144,15 @@ def test_winapps_screenshot_serves_a_png_and_reports_stale_windows(web_server, m
     import web_ui
 
     png = b"\x89PNG\r\n\x1a\n"
-    monkeypatch.setattr(web_ui.winapps, "winapps_window_screenshot", lambda window_id: png)
-    reply = urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/screenshot")
+    screenshots = []
+    monkeypatch.setattr(web_ui.winapps, "winapps_window_screenshot",
+                        lambda window_id, token=None: screenshots.append((window_id, token)) or png)
+    reply = urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/screenshot?windowToken=token-a")
     assert reply.status == 200 and reply.headers["Content-Type"] == "image/png"
     assert reply.headers["Cache-Control"] == "no-store" and reply.read() == png
+    assert screenshots == [("7", "token-a")]
 
-    def stale(_window_id):
+    def stale(_window_id, _token=None):
         raise web_ui.winapps.WinAppError("That window is not on screen anymore; refresh the mirror")
 
     monkeypatch.setattr(web_ui.winapps, "winapps_window_screenshot", stale)
@@ -163,13 +166,14 @@ def test_winapps_stream_serves_bounded_multipart_frames_without_caching(web_serv
     import web_ui
 
     frames = []
+    png = web_ui.winapps._png(1, 1, bytes(4))
 
-    def stream(window_id, fps):
-        frames.append((window_id, fps))
-        return (b"\x89PNG first", b"\x89PNG second")
+    def stream(window_id, fps, expected_token=None):
+        frames.append((window_id, fps, expected_token))
+        return (png, png)
 
     monkeypatch.setattr(web_ui.winapps, "winapps_window_stream", stream)
-    reply = urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/stream?fps=50")
+    reply = urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/stream?fps=50&windowToken=token-a")
     body = reply.read()
     assert reply.status == 200
     assert reply.headers["Content-Type"] == "multipart/x-mixed-replace; boundary=frame"
@@ -177,14 +181,23 @@ def test_winapps_stream_serves_bounded_multipart_frames_without_caching(web_serv
     assert reply.headers["X-Content-Type-Options"] == "nosniff"
     assert body.count(b"--frame\r\n") == 2
     assert b"Content-Type: image/png\r\n" in body
-    assert b"\x89PNG first" in body and b"\x89PNG second" in body
-    assert frames == [("7", web_ui.winapps.MAX_STREAM_FPS)]
+    parts = body.split(b"--frame\r\n")[1:]
+    assert len(parts) == 2
+    for part in parts:
+        headers, payload = part.split(b"\r\n\r\n", 1)
+        content_length = int(next(line.split(b": ", 1)[1] for line in headers.split(b"\r\n")
+                                  if line.startswith(b"Content-Length: ")))
+        assert payload == png + b"\r\n"
+        assert content_length == len(png)
+    assert frames == [("7", web_ui.winapps.MAX_STREAM_FPS, "token-a")]
 
 
 def test_winapps_stream_reports_a_stale_window_before_streaming(web_server, monkeypatch):
     import web_ui
 
-    def stale(_window_id, _fps):
+    def stale(_window_id, _fps, _expected_token=None):
+        if False:
+            yield b""
         raise web_ui.winapps.WinAppError("That window is not on screen anymore; refresh the mirror")
 
     monkeypatch.setattr(web_ui.winapps, "winapps_window_stream", stale)
@@ -192,6 +205,17 @@ def test_winapps_stream_reports_a_stale_window_before_streaming(web_server, monk
         urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/stream")
     assert caught.value.code == 400
     assert "not on screen" in json.loads(caught.value.read().decode("utf-8"))["error"]
+
+
+def test_winapps_stream_rejects_an_invalid_first_frame_before_headers(web_server, monkeypatch):
+    import web_ui
+
+    monkeypatch.setattr(web_ui.winapps, "winapps_window_stream",
+                        lambda _window_id, _fps, _token=None: iter([b"not a PNG"]))
+    with pytest.raises(urllib.error.HTTPError) as caught:
+        urllib.request.urlopen(f"{web_server}/api/labs/winapps/apps/7/stream")
+    assert caught.value.code == 502
+    assert "invalid PNG" in json.loads(caught.value.read().decode("utf-8"))["error"]
 
 
 def test_winapps_stream_is_unavailable_without_the_native_module(web_server, monkeypatch):
@@ -226,11 +250,11 @@ def test_winapps_uia_routes_return_elements_search_and_explicit_errors(web_serve
         "elements": [], "diff": {"added": [], "changed": [], "removed": []},
     }
     search = {"windowId": 7, "app": "Example", "revision": "rev-1", "query": "save", "count": 0, "hits": []}
-    monkeypatch.setattr(web_ui.winapps, "winapps_window_elements", lambda hwnd, revision: {
-        **elements, "windowId": int(hwnd), "requestedRevision": revision,
+    monkeypatch.setattr(web_ui.winapps, "winapps_window_elements", lambda hwnd, revision, token: {
+        **elements, "windowId": int(hwnd), "requestedRevision": revision, "requestedToken": token,
     })
-    monkeypatch.setattr(web_ui.winapps, "winapps_search_elements", lambda hwnd, query: {
-        **search, "windowId": int(hwnd), "query": query,
+    monkeypatch.setattr(web_ui.winapps, "winapps_search_elements", lambda hwnd, query, token: {
+        **search, "windowId": int(hwnd), "query": query, "requestedToken": token,
     })
     monkeypatch.setattr(web_ui.winapps, "winapps_control_state", lambda: {
         "armed": False, "owner": None, "expiresInSec": 0,
@@ -238,20 +262,21 @@ def test_winapps_uia_routes_return_elements_search_and_explicit_errors(web_serve
     })
 
     data = json.loads(urllib.request.urlopen(
-        f"{web_server}/api/labs/winapps/apps/7/elements?revision=old"
+        f"{web_server}/api/labs/winapps/apps/7/elements?revision=old&windowToken=token-a"
     ).read().decode("utf-8"))
     assert data["requestedRevision"] == "old" and data["windowId"] == 7
+    assert data["requestedToken"] == "token-a"
     result = json.loads(urllib.request.urlopen(
-        f"{web_server}/api/labs/winapps/apps/7/search?q=save"
+        f"{web_server}/api/labs/winapps/apps/7/search?q=save&windowToken=token-a"
     ).read().decode("utf-8"))
-    assert result["query"] == "save"
+    assert result["query"] == "save" and result["requestedToken"] == "token-a"
     control = json.loads(urllib.request.urlopen(
         f"{web_server}/api/labs/winapps/control"
     ).read().decode("utf-8"))
     assert control["armed"] is False
     assert control["recentActions"][0]["action"] == "double_click"
 
-    def unsupported(_hwnd, _revision):
+    def unsupported(_hwnd, _revision, _token=None):
         raise web_ui.winapps.WinAppError("UI Automation is unavailable", status=501, code="UIA_UNAVAILABLE")
 
     monkeypatch.setattr(web_ui.winapps, "winapps_window_elements", unsupported)
@@ -287,18 +312,37 @@ def test_winapps_control_post_routes_require_header_and_dispatch_actions(web_ser
     monkeypatch.setattr(web_ui.winapps, "winapps_control_input", input_action)
     monkeypatch.setattr(web_ui.winapps, "winapps_panic_stop", stop)
 
-    status, rejected = _post(f"{web_server}/api/labs/winapps/control", {"armed": True, "owner": "panel"})
+    arm_payload = {"armed": True, "owner": "panel"}
+    binding = {
+        "windowId": 7, "windowToken": "a" * 24, "revision": "b" * 16,
+        "elementId": "c" * 16, "elementBounds": {"x": 40, "y": 20, "w": 80, "h": 24},
+        "owner": "panel", "confirm": True,
+    }
+    click_payload = {
+        **binding, "x": 80, "y": 32, "action": "click", "deltaX": 0, "deltaY": 0,
+        "actionId": "action-1",
+    }
+    input_payload = {**binding, "kind": "key", "key": "tab", "actionId": "action-2"}
+    status, rejected = _post(f"{web_server}/api/labs/winapps/control", arm_payload)
     assert status == 403 and "X-OSLab" in rejected["error"]
     headers = {"X-OSLab": "1"}
-    assert _post(f"{web_server}/api/labs/winapps/control", {"armed": True, "owner": "panel"}, headers)[0] == 200
-    assert _post(f"{web_server}/api/labs/winapps/click", {"x": 4, "y": 5}, headers)[0] == 200
-    assert _post(f"{web_server}/api/labs/winapps/input", {"kind": "key", "key": "tab"}, headers)[0] == 200
-    assert _post(f"{web_server}/api/labs/winapps/input",
-                 {"kind": "double_click", "x": 4, "y": 5}, headers)[0] == 200
-    assert _post(f"{web_server}/api/labs/winapps/input",
-                 {"kind": "scroll", "x": 4, "y": 5, "deltaX": 0, "deltaY": 120}, headers)[0] == 200
+    input_double_click_payload = {**binding, "kind": "double_click", "x": 4, "y": 5, "actionId": "action-3"}
+    input_scroll_payload = {**binding, "kind": "scroll", "x": 4, "y": 5, "deltaX": 0, "deltaY": 120, "actionId": "action-4"}
+    assert _post(f"{web_server}/api/labs/winapps/control", arm_payload, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/click", click_payload, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/input", input_payload, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/input", input_double_click_payload, headers)[0] == 200
+    assert _post(f"{web_server}/api/labs/winapps/input", input_scroll_payload, headers)[0] == 200
     assert _post(f"{web_server}/api/labs/winapps/stop", {}, headers)[0] == 200
     assert [call[0] for call in calls] == ["arm", "click", "input", "input", "input", "stop"]
+    assert calls == [
+        ("arm", True, "panel"),
+        ("click", click_payload),
+        ("input", input_payload),
+        ("input", input_double_click_payload),
+        ("input", input_scroll_payload),
+        ("stop",),
+    ]
     assert calls[3][1]["kind"] == "double_click"
     assert calls[4][1]["deltaY"] == 120
 
@@ -381,3 +425,45 @@ def test_app_update_status_is_reported_without_network(web_server):
     assert "supported" in data and "updateAvailable" in data
     assert data["install"] is None
 
+
+class _FakeFrida:
+    name = "api"
+
+    def __init__(self):
+        self.calls = []
+
+    def devices(self):
+        self.calls.append("devices")
+        return [{"id": "local", "type": "local", "transport": "local", "name": "Local System", "os": None},
+                {"id": "socket", "type": "remote", "transport": "TCP", "name": "Local Socket", "os": None}]
+
+    def processes(self, device_id, host, apps):
+        self.calls.append(("processes", device_id, host))
+        return [{"pid": 10, "name": "sleep"}]
+
+
+def test_frida_inventory_lists_attachable_targets(web_server, monkeypatch):
+    import web_ui
+    fake = _FakeFrida()
+    monkeypatch.setattr(web_ui.frida_inventory, "pick_backend", lambda *args, **kwargs: fake)
+    data = json.load(urllib.request.urlopen(f"{web_server}/api/frida/inventory"))
+    assert data["schema"] == "oslab.frida-inventory/1" and data["readOnly"] is True
+    assert [d["id"] for d in data["devices"]] == ["local", "socket"]
+    assert data["devices"][0]["processes"] == [{"pid": 10, "name": "sleep"}]
+    assert data["devices"][1]["processes"] is None  # an unnamed remote entry is never probed
+
+    data = json.load(urllib.request.urlopen(f"{web_server}/api/frida/inventory?host=127.0.0.1:27042"))
+    assert [d["id"] for d in data["devices"]] == ["tcp@127.0.0.1:27042"]
+    assert fake.calls[-1] == ("processes", "tcp@127.0.0.1:27042", "127.0.0.1:27042")
+
+
+def test_frida_inventory_refuses_targets_outside_the_lab(web_server, monkeypatch):
+    import web_ui
+    fake = _FakeFrida()
+    monkeypatch.setattr(web_ui.frida_inventory, "pick_backend", lambda *args, **kwargs: fake)
+    for host in ("8.8.8.8", "example.com"):
+        with pytest.raises(urllib.error.HTTPError) as refused:
+            urllib.request.urlopen(f"{web_server}/api/frida/inventory?host={host}")
+        assert refused.value.code == 400
+        assert "error" in json.load(refused.value)
+    assert fake.calls == []

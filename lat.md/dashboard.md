@@ -65,7 +65,8 @@ submit-class confirms for Enter and pastes even while armed, a persistent
 panic Stop, single-owner arming, and read-only windows/menu-bar/focused
 endpoints. `console/mcp_server.py` exposes the same guarded surface as a
 stdio MCP server — the model acts, the console guards, every step is
-audited. See [[ios-lab]] for permissions.
+audited. See [[ios-lab]] for permissions. The same server carries the Cleanup
+Lab tools, described in [[cleanup-lab#Dashboard pages#MCP tools (CUX-10)]].
 
 
 ## macOS engine panel
@@ -86,7 +87,10 @@ On Windows, `winapps` mirrors visible windows via `/api/labs/winapps/apps`,
 resize, dock/hide, selection, stream fallback, and retry.
 
 The backend uses ctypes to enumerate visible, captioned top-level windows and
-captures one window with `PrintWindow(PW_RENDERFULLCONTENT)`. The panel shows
+captures one window with a bounded `WM_PRINT` request. An unresponsive app gets
+up to 1.5 seconds to paint; desktop-pixel fallback is used only when no higher
+window overlaps the target. Otherwise the API returns a timeout instead of
+blocking the console worker. The panel shows
 the selected window at its own aspect ratio, its dimensions and an `Elevated`
 badge when the owning process is elevated; only the newest capture updates the
 view. It is mounted only locally, is separate from the WSL2-backed VM lifecycle,
@@ -96,20 +100,40 @@ visible, non-password controls with roles, labels and window-relative bounds;
 matches labels or roles with at most 50 results. The mirror can display and
 search these controls as clickable hotspots.
 
+The local panel also supports a draggable/resizable floating mirror, dock/hide,
+and a bounded multipart PNG stream at
+`/api/labs/winapps/apps/<hwnd>/stream?fps=` with a screenshot-poll fallback.
+At most two streams can capture at once. Each stream is bound to the selected
+window identity and ends if the HWND is recycled, the client disconnects, or
+the stream reaches its time limit. Multipart frames are validated PNGs and are
+capped to the largest capture dimensions the backend permits. A stalled stream
+times out in the browser and falls back to snapshots; a large valid frame does
+not trigger polling. The floating panel clamps drag and resize bounds to the
+viewport and its contents remain scrollable on narrow screens.
+
 Control is separate and opt-in: `/control` grants one local owner a ten-minute
 lock, renewed after confirmed actions, and returns a bounded recent-action
-summary. Click and keyboard input require that lock, `confirm: true`, a fresh
-visible HWND, a foreground check for keyboard input, and bounded key/text
-allowlists. `/input` also supports double-click, right-click and bounded
-horizontal/vertical scroll deltas; the dashboard previews each target in a
-confirmation dialog, refreshes UIA after a successful action, and explicitly
-warns that Enter can submit a form. Win32 bounds, UIA rectangles, capture
-pixels and pointer coordinates share a per-monitor-aware physical-pixel space.
-Capture retries `PrintWindow(PW_RENDERFULLCONTENT)` and permits desktop blit
-fallback only when the target is not overlapped. A panic-stop endpoint disarms
-the lock and ends active mirror streams. Input auditing never retains typed
-text or window titles. Mutating requests continue to require the console's
-localhost/Host validation and `X-OSLab: 1`.
+summary. Click and keyboard input require the lock, a confirmation, a current
+window identity and UIA revision, plus a foreground check immediately before
+delivery. Focus is requested through UI Automation; the console does not force
+foreground with `SetForegroundWindow` or `BringWindowToTop`, and rejects the
+action if the target is not foreground. Hotspot clicks are bound to a visible
+element ID and bounds; text and key input are bound to the previewed focused
+element. `/click` supports single, double, right-click and bounded scroll
+actions; `/input` accepts printable text, the restricted navigation key
+allowlist, or UIA-bound double-click, right-click and bounded scroll actions. Window identity tokens accompany captures, UIA reads, and actions
+so a recycled HWND cannot silently retarget an existing mirror or approval.
+Each confirmed action has a bounded idempotency key and is rejected if its UIA
+revision or control bounds changed after preview. The dashboard previews each
+target in a confirmation dialog; Enter is explicitly called out because it can
+submit a form. Win32 bounds, UIA rectangles, capture pixels and pointer
+coordinates share a per-monitor-aware physical-pixel space. Capture retries
+`PrintWindow(PW_RENDERFULLCONTENT)` and permits desktop blit fallback only
+when the target is not overlapped. A panic-stop endpoint disarms the lock and
+ends active mirror streams. The `/control` status includes a short safe audit
+summary; it never includes typed text or window titles. Input auditing is
+bounded. Mutating requests continue to require the console's localhost/Host
+validation and `X-OSLab: 1`.
 
 ## UX readiness
 

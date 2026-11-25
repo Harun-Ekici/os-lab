@@ -105,8 +105,8 @@ push; `OSLAB_SKIP_PREPUSH=1` skips it.
 Android and Source Lab have independent automated test suites.
 
 It lives in [[android-lab/lab/tests]] (analyzer, reporter, MobSF client, secret
-scanner, patcher, flow parser, agentic engine, web UI, the host engine in
-[[console/oslab.py]] and the [[tooling#Scope guard]]). Shell scripts across the
+scanner, patcher, flow parser, agentic engine, `frida-trace` call-map builder,
+web UI, the host engine in [[console/oslab.py]] and the [[tooling#Scope guard]]). Shell scripts across the
 VM labs are kept `bash -n` clean and use `set -euo pipefail`.
 The [[source-lab]] engine tests run in their own process from
 [[source-lab/engine]] so their imports cannot collide with Android tests.
@@ -148,6 +148,11 @@ in nft, one tcp and one udp command in UFW), never all traffic. A port on `icmp`
 is ignored by both backends. Items that are not ports or ascending ranges in
 1–65535 (`esp`, `80,,443`, `500:400`) are skipped with a comment and a stderr
 warning. Notes and names are flattened to one line before they go into comments.
+
+A multi-site company keeps one rule set per branch and is rendered one site at a time with
+`--branch`. `siber-guvenlik-sirketi` declares four sites (`istanbul-hq`, `sivas-soc`,
+`ankara-academy`, `dubai-field`) in [[firewall-lab/companies/siber-guvenlik-sirketi/company.json]];
+each renders on its own to UFW, nftables or the table form.
 [[.github/workflows/firewall-lab.yml]] renders every branch of every company and
 checks the output with `nft -c` and `bash -n`, and rejects duplicate branch ids.
 
@@ -285,3 +290,11 @@ do not distribute OS media; users are responsible for valid licences.
 [[dashboard/scripts/source-brain-model.test.mjs]] validates provider paths, graph
 limits/windows and bounded revision diff without a browser.
 [[source-lab/RUNBOOK.md]] records the portable release/rollback workflow.
+
+## Two-stage dropper detection harness
+
+[[scripts/analysis/dropper_detect.py]] and [[scripts/analysis/dropper_lab/README.md]]
+provide an offline static and loopback-rehearsal detector for two-stage "clean dropper"
+loaders (`PENT-15`), correlating remote fetch, deferred triggers, payload decoding and
+dynamic execution sinks without flagging benign utilities.
+

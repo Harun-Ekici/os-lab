@@ -59,9 +59,13 @@ try:
 except ImportError:
     web_api = None
 try:
-    import winapps  # noqa: E402  (console/winapps.py: read-only native Windows app mirror)
+    import winapps  # noqa: E402  (console/winapps.py: native Windows app mirror and guarded UIA control)
 except ImportError:
     winapps = None
+try:
+    import frida_inventory  # noqa: E402  (console/frida_inventory.py: read-only Frida device and process inventory)
+except ImportError:
+    frida_inventory = None
 ARTIFACTS_DIR = os.path.join(SCRIPT_DIR, "artifacts")
 SCRIPTS_DIR = os.path.join(SCRIPT_DIR, "scripts")
 
@@ -139,6 +143,7 @@ def read_web_file(name: str) -> bytes:
 ALLOWED_HOSTS = {"127.0.0.1", "localhost", "::1"}
 HOST_CACHE = {"at": 0.0, "value": None}
 HOST_LOCK = threading.Lock()
+FRIDA_TIMEOUT = 8
 CONTENT = (content_packs.ContentStore(content_packs.default_content_dir(), REPO_ROOT)
            if content_packs else None)
 APP = app_updates.AppUpdateStore() if app_updates else None
@@ -258,6 +263,9 @@ class LabHttpHandler(BaseHTTPRequestHandler):
         if path.startswith("/api/app/update"):
             self._app_get(path)
             return
+        if path == "/api/frida/inventory":
+            self._frida_get(urllib.parse.parse_qs(parsed.query))
+            return
         if path.startswith(("/api/host", "/api/labs", "/api/jobs", "/api/capabilities", "/api/scope")):
             if not oslab:
                 self._json(501, {"error": "The console module (console/oslab.py) is not installed"})
@@ -304,6 +312,18 @@ class LabHttpHandler(BaseHTTPRequestHandler):
             self._json(200, cleanup_api.CleanupAPI(REPO_ROOT).get(path, query))
         except cleanup_api.CleanupError as exc:
             self._json(exc.status, {"error": str(exc)})
+
+    def _frida_get(self, query: dict):
+        """Jobs view: the devices and processes Frida can attach to right now (PENT-09). Read-only."""
+        if frida_inventory is None:
+            self._json(501, {"error": "The Frida inventory (console/frida_inventory.py) is not installed"})
+            return
+        host = (query.get("host") or [""])[0].strip() or None
+        try:
+            # A short timeout: the card waits on this answer, and an absent target should fail fast.
+            self._json(200, frida_inventory.build_inventory(host=host, timeout=FRIDA_TIMEOUT))
+        except frida_inventory.ScopeError as exc:
+            self._json(400, {"error": str(exc)})
 
     def _cleanup_post(self, path: str):
         """Cleanup Lab: typed actions only (start a scan, plan or clean job, cancel one)."""
@@ -540,7 +560,12 @@ class LabHttpHandler(BaseHTTPRequestHandler):
                 self._json(501, {"error": "The Windows app mirror module (console/winapps.py) is not installed"})
                 return
             try:
-                self._send_bytes(200, winapps.winapps_window_screenshot(parts[4]), "image/png", cache="no-store")
+                query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
+                expected_token = (query.get("windowToken") or [None])[0]
+                self._send_bytes(
+                    200, winapps.winapps_window_screenshot(parts[4], expected_token),
+                    "image/png", cache="no-store",
+                )
             except winapps.WinAppError as exc:
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
         elif len(parts) == 6 and parts[:4] == ["api", "labs", "winapps", "apps"] and parts[5] == "elements":
@@ -549,17 +574,20 @@ class LabHttpHandler(BaseHTTPRequestHandler):
                 return
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
             revision = (query.get("revision") or [None])[0]
+            expected_token = (query.get("windowToken") or [None])[0]
             try:
-                self._json(200, winapps.winapps_window_elements(parts[4], revision))
+                self._json(200, winapps.winapps_window_elements(parts[4], revision, expected_token))
             except winapps.WinAppError as exc:
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
         elif len(parts) == 6 and parts[:4] == ["api", "labs", "winapps", "apps"] and parts[5] == "search":
             if winapps is None:
                 self._json(501, {"error": "The Windows app mirror module (console/winapps.py) is not installed"})
                 return
-            query = (urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True).get("q") or [""])[0]
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query, keep_blank_values=True)
+            search_query = (query.get("q") or [""])[0]
+            expected_token = (query.get("windowToken") or [None])[0]
             try:
-                self._json(200, winapps.winapps_search_elements(parts[4], query))
+                self._json(200, winapps.winapps_search_elements(parts[4], search_query, expected_token))
             except winapps.WinAppError as exc:
                 self._json(exc.status, {"error": str(exc), "code": exc.code})
         elif len(parts) == 4 and parts[:2] == ["api", "labs"] and parts[2:] == ["winapps", "control"]:
@@ -736,8 +764,10 @@ class LabHttpHandler(BaseHTTPRequestHandler):
 
         frames = None
         try:
-            frames = iter(winapps.winapps_window_stream(window_id, fps))
+            expected_token = (query.get("windowToken") or [None])[0]
+            frames = iter(winapps.winapps_window_stream(window_id, fps, expected_token))
             first = next(frames)
+            winapps.validate_png_frame(first)
         except winapps.WinAppError as exc:
             close = getattr(frames, "close", None)
             if close:
@@ -765,6 +795,11 @@ class LabHttpHandler(BaseHTTPRequestHandler):
         try:
             write_frame(first)
             for frame in frames:
+                try:
+                    winapps.validate_png_frame(frame)
+                except winapps.WinAppError as exc:
+                    self.log_error("WinApps stream ended on an invalid frame: %s", exc)
+                    return
                 write_frame(frame)
         except OSError:
             pass  # the client disconnected or its socket closed
